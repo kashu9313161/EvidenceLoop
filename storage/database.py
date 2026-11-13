@@ -3,7 +3,6 @@ import sqlite3
 
 from core.config import DATABASE_PATH
 
-
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 

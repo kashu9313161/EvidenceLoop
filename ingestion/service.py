@@ -1,30 +1,25 @@
 
 import hashlib
 import io
-import json
 import re
-import shutil
 import stat
 import zipfile
-
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 import httpx
 
 from core.config import (
-    DATA_DIR,
-    REPOSITORIES_DIR,
-    MAX_ARCHIVE_DOWNLOAD_BYTES,
-    MAX_TOTAL_UNCOMPRESSED_BYTES,
-    MAX_FILE_UNCOMPRESSED_BYTES,
-    MAX_FILES,
-    SUPPORTED_EXTENSIONS,
     IGNORED_DIRECTORY_NAMES,
     IGNORED_FILE_NAMES,
+    MAX_ARCHIVE_DOWNLOAD_BYTES,
+    MAX_FILE_UNCOMPRESSED_BYTES,
+    MAX_FILES,
+    MAX_TOTAL_UNCOMPRESSED_BYTES,
+    REPOSITORIES_DIR,
+    SUPPORTED_EXTENSIONS,
 )
-from storage.database import get_connection, initialize_database
-
+from storage.database import get_connection, get_snapshot, initialize_database
 
 GITHUB_API = "https://api.github.com"
 
@@ -46,12 +41,18 @@ def parse_github_url(url: str) -> tuple[str, str]:
     if parsed.hostname not in {"github.com", "www.github.com"}:
         raise IngestionError("Only public GitHub repositories are supported.")
 
-    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if parsed.port is not None:
+        raise IngestionError("Custom ports are not allowed.")
+    
+    if parsed.query or parsed.fragment:
+        raise IngestionError("Query parameters and fragments are not allowed.")
 
-    if len(parts) < 2:
-        raise IngestionError("Expected a URL like https://github.com/owner/repo")
+    parts = parsed.path.strip("/").split("/")
 
-    owner, repository = parts[0], parts[1]
+    if len(parts) != 2:
+        raise IngestionError("Expected exactly: https://github.com/owner/repository")
+
+    owner, repository = parts
 
     repository = re.sub(r"\.git$", "", repository)
 
@@ -60,10 +61,13 @@ def parse_github_url(url: str) -> tuple[str, str]:
     if not valid.fullmatch(owner) or not valid.fullmatch(repository):
         raise IngestionError("Invalid GitHub owner or repository name.")
 
+    if owner in {".", ".."} or repository in {".", ".."}:
+        raise IngestionError("Invalid repository path.")
+
     return owner, repository
 
 
-def github_download(url: str) -> tuple[dict, str, bytes]:
+def github_download(owner: str, name: str) -> tuple[dict, str, bytes]:
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "EvidenceLoop-Local",
@@ -75,31 +79,74 @@ def github_download(url: str) -> tuple[dict, str, bytes]:
             follow_redirects=True,
             headers=headers,
         ) as client:
-            metadata_response = client.get(url)
+
+            # fetch repository metadata
+            metadata_response = client.get(
+                f"{GITHUB_API}/repos/{owner}/{name}"
+            )
             metadata_response.raise_for_status()
             metadata = metadata_response.json()
 
-            owner = metadata["owner"]["login"]
-            name = metadata["name"]
-            branch = metadata["default_branch"]
+            if metadata.get("private") is not False:
+                raise IngestionError("Only Public repositories are supported.")
 
+            # 2. Resolve the default branch
+            branch = metadata.get("default_branch")
+
+            if not branch:
+                raise IngestionError("Could not determine repository default branch.")
+
+            # 3. Resolve exact commit SHA
             commit_response = client.get(
                 f"{GITHUB_API}/repos/{owner}/{name}/commits/{branch}"
             )
-            commit_response.raise_for_status()
-            commit_sha = commit_response.json()["sha"]
 
+            commit_response.raise_for_status()
+            commit_data = commit_response.json()
+            commit_sha = commit_data.get("sha")
+
+            if not commit_sha:
+                raise IngestionError("Github did not return a commit SHA.")
+
+            # 4. Download the archive for the exact commit
             archive_response = client.get(
                 f"{GITHUB_API}/repos/{owner}/{name}/zipball/{commit_sha}"
             )
             archive_response.raise_for_status()
 
+            # check Content-length before reading when available.
+            content_length = archive_response.headers.get("Content-Length")
+
+            if content_length:
+                if int(content_length) > MAX_ARCHIVE_DOWNLOAD_BYTES:
+                    raise IngestionError(
+                        "Repository archive exceeds the download size limit."
+                    )
+
             archive = archive_response.content
 
+    except IngestionError:
+        raise
+
     except httpx.HTTPError as exc:
-        raise IngestionError(f"GitHub request failed: {exc}") from exc
-    except (KeyError, ValueError) as exc:
-        raise IngestionError("GitHub returned unexpected repository metadata.") from exc
+        status = exc.response.status_code
+
+        if status == 404:
+            raise IngestionError("Repository not found or not publicly accessible.") from exc
+
+        if status == 403:
+            raise IngestionError(
+                "GitHub API rate limit access restriction encountered."
+            ) from exc
+
+        
+        raise IngestionError(
+            f"GitHub returned HTTP {status}.") from exc
+
+    
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        raise IngestionError("" \
+        f"GitHub request failed: {exc}") from exc
 
     if len(archive) > MAX_ARCHIVE_DOWNLOAD_BYTES:
         raise IngestionError("Repository archive exceeds the download size limit.")
@@ -107,8 +154,8 @@ def github_download(url: str) -> tuple[dict, str, bytes]:
     return metadata, commit_sha, archive
 
 
-def safe_relative_path(name: str) -> str:
-    # ZIP paths are POSIX paths, but reject Windows separators too.
+
+def safe_relative_path(name: str, strip_root: str | None = None) -> str:
     if "\\" in name or "\x00" in name:
         raise IngestionError(f"Unsafe archive path: {name!r}")
 
@@ -123,8 +170,10 @@ def safe_relative_path(name: str) -> str:
     if re.match(r"^[A-Za-z]:", name):
         raise IngestionError(f"Windows absolute path is not allowed: {name!r}")
 
-    # GitHub ZIP archives have one top-level wrapper directory.
-    parts = path.parts[1:]
+    parts = path.parts
+
+    if strip_root and parts[0] == strip_root:
+        parts = parts[1:]
 
     if not parts:
         return ""
@@ -182,6 +231,27 @@ def safe_extract_archive(
     with archive:
         entries = archive.infolist()
 
+        file_entries = [entry for entry in entries if not entry.is_dir()]
+        first_parts = {
+            PurePosixPath(entry.filename).parts[0]
+            for entry in file_entries
+            if PurePosixPath(entry.filename).parts
+        }
+
+        strip_root = None
+
+        if file_entries and len(first_parts) == 1:
+            candidate_root = next(iter(first_parts))
+
+            all_have_root = all(
+                len(PurePosixPath(entry.filename).parts) > 1
+                and PurePosixPath(entry.filename).parts[0] == candidate_root
+                for entry in file_entries
+            )
+
+            if all_have_root:
+                strip_root = candidate_root
+
         if len(entries) > MAX_FILES:
             raise IngestionError("Archive contains too many entries.")
 
@@ -189,7 +259,10 @@ def safe_extract_archive(
             if entry.is_dir():
                 continue
 
-            relative_path = safe_relative_path(entry.filename)
+            relative_path = safe_relative_path(
+                entry.filename,
+                strip_root=strip_root,
+            )
 
             if not relative_path:
                 continue
@@ -281,7 +354,7 @@ def persist_snapshot(
     archive_sha = sha256_bytes(archive_bytes)
 
     snapshot_id = (
-        commit_sha
+        f"{repository_id}@{commit_sha}"
         if commit_sha
         else f"zip-{archive_sha[:24]}"
     )
@@ -352,9 +425,11 @@ def persist_snapshot(
 def ingest_github_repository(url: str) -> dict:
     owner, name = parse_github_url(url)
 
-    metadata, commit_sha, archive_bytes = github_download(url)
-
     repository_id = f"github:{owner}/{name}"
+
+    _metadata, commit_sha, archive_bytes = github_download(owner, name)
+
+    snapshot_id = f"{repository_id}@{commit_sha}"
 
     destination = (
         REPOSITORIES_DIR
@@ -363,14 +438,16 @@ def ingest_github_repository(url: str) -> dict:
     )
 
     if destination.exists():
-        # Snapshot is already present. Database remains the source of truth.
-        return {
-            "repository_id": repository_id,
-            "snapshot_id": commit_sha,
-            "commit_sha": commit_sha,
-            "root_path": str(destination),
-            "already_downloaded": True,
-        }
+        existing_snapshot = get_snapshot(snapshot_id)
+
+        if existing_snapshot is not None:
+            return {
+                "repository_id": repository_id,
+                "snapshot_id": snapshot_id,
+                "commit_sha": commit_sha,
+                "root_path": str(destination),
+                "already_downloaded": True,
+            }
 
     records = safe_extract_archive(archive_bytes, destination)
 
@@ -392,8 +469,12 @@ def ingest_github_repository(url: str) -> dict:
         "commit_sha": commit_sha,
         "root_path": str(destination),
         "total_files": len(records),
-        "eligible_files": sum(r["status"] == "pending" for r in records),
-        "skipped_files": sum(r["status"] == "skipped" for r in records),
+        "eligible_files": sum(
+            record["status"] == "pending" for record in records
+        ),
+        "skipped_files": sum(
+            record["status"] == "skipped" for record in records
+        ),
         "already_downloaded": False,
     }
 
