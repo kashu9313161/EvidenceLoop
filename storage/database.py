@@ -1,5 +1,5 @@
  
-import sqlite3
+import sqlite3 
 
 from core.config import DATABASE_PATH
 
