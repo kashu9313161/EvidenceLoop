@@ -1,0 +1,30 @@
+[project]
+name = "evidenceloop"
+version = "0.1.0"
+description = "Evidence-grounded codebase intelligence (local-first)."
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "streamlit>=1.35",
+  "pydantic>=2.6",
+  "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# Extracted repositories under data/ contain their own test suites.
+norecursedirs = ["data", ".venv", ".git"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
