@@ -6,7 +6,6 @@ import zipfile
 import httpx
 import pytest
 
-from core import config
 from ingestion import service
 from ingestion.service import (
     IngestionError,
@@ -50,13 +49,6 @@ def make_zip_entries(entries: list[zipfile.ZipInfo | tuple[str, bytes]]) -> byte
                 archive.writestr(entry, b"data")
 
     return buffer.getvalue()
-
-
-@pytest.fixture
-def isolated_storage(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DATABASE_PATH", tmp_path / "test.db")
-    monkeypatch.setattr(service, "REPOSITORIES_DIR", tmp_path / "repositories")
-    return tmp_path
 
 
 # ---------------------------------------------------------------------------

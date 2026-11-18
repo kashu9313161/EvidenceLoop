@@ -657,7 +657,14 @@ def ingest_zip_file(zip_path: Path) -> dict:
     if zip_path.stat().st_size > MAX_ARCHIVE_DOWNLOAD_BYTES:
         raise IngestionError("ZIP exceeds the download size limit.")
 
-    archive_bytes = zip_path.read_bytes()
+    return ingest_zip_bytes(zip_path.read_bytes(), zip_path.stem)
+
+
+def ingest_zip_bytes(archive_bytes: bytes, name: str) -> dict:
+    """Ingest an uploaded ZIP held in memory (e.g. from the Streamlit uploader)."""
+    if len(archive_bytes) > MAX_ARCHIVE_DOWNLOAD_BYTES:
+        raise IngestionError("ZIP exceeds the download size limit.")
+
     archive_id = sha256_bytes(archive_bytes)[:24]
     snapshot_id = f"zip-{archive_id}"
 
@@ -668,8 +675,7 @@ def ingest_zip_file(zip_path: Path) -> dict:
         source_type="zip",
         source_url=None,
         owner=None,
-        name=zip_path.stem,
+        name=name or "upload",
         commit_sha=None,
         destination=REPOSITORIES_DIR / "uploaded_zips" / snapshot_id,
     )
-

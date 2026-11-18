@@ -129,3 +129,35 @@ def get_coverage(snapshot_id: str):
             """,
             (snapshot_id,),
         ).fetchall()
+
+
+def list_snapshots() -> list[sqlite3.Row]:
+    """All ingested snapshots, newest first, joined with repository identity."""
+    initialize_database()
+
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT s.snapshot_id, s.repository_id, s.commit_sha, s.archive_sha256,
+                   s.root_path, s.total_files, s.eligible_files, s.skipped_files,
+                   s.created_at, r.source_type, r.source_url, r.owner, r.name
+            FROM snapshots AS s
+            JOIN repositories AS r ON r.repository_id = s.repository_id
+            ORDER BY s.created_at DESC, s.snapshot_id
+            """
+        ).fetchall()
+
+
+def get_coverage_summary(snapshot_id: str) -> list[sqlite3.Row]:
+    """File counts and bytes grouped by status and skip reason."""
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT status, skip_reason, COUNT(*) AS files, SUM(size_bytes) AS bytes
+            FROM files
+            WHERE snapshot_id = ?
+            GROUP BY status, skip_reason
+            ORDER BY files DESC
+            """,
+            (snapshot_id,),
+        ).fetchall()
