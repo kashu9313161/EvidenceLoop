@@ -544,7 +544,7 @@ def persist_snapshot(
 
     # One transaction: repository, snapshot and file rows land together.
     with get_connection() as connection:
-        connection.execute(
+        connection.execute( 
             """
             INSERT OR IGNORE INTO repositories
             (repository_id, source_type, source_url, owner, name)

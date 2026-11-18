@@ -10,6 +10,7 @@ import { Inspector } from '../components/Inspector'
 import { Issues } from '../components/Issues'
 import { MapView } from '../components/MapView'
 import { Overview } from '../components/Overview'
+import { useChatPosition } from '../useChatPosition'
 
 const TABS = [
   { id: 'overview', label: 'Overview' },
@@ -32,6 +33,7 @@ export function Workspace() {
   const [chatLog, setChatLog] = useState<{ snapshot: string; messages: ChatMessage[] }>({ snapshot: '', messages: [] })
   const [ai, setAi] = useState<AiStatus | null>(null)
   const historyFor = useRef<string | null>(null)
+  const chatPosition = useChatPosition()
   const messages = chatLog.snapshot === snapshotId ? chatLog.messages : []
 
   const selected = params.get('file')
@@ -197,11 +199,12 @@ export function Workspace() {
       </main>
 
       {chat === 'open' ? (
-        <ChatPanel repoName={repo.name} ai={ai} messages={messages} examples={exampleQuestions(report)}
+        <ChatPanel anchor={chatPosition.pos} repoName={repo.name} ai={ai} messages={messages} examples={exampleQuestions(report)}
           onSend={sendQuestion} onMinimise={() => setChat('minimised')} onClose={() => setChat('closed')}
           onOpenCode={(path, at) => { setChat('minimised'); openCode(path, at) }} onShowInMap={showInMap} />
       ) : (
-        <ChatButton busy={busy} shifted={!!inspector} onClick={openChat} />
+        <ChatButton busy={busy} shifted={!!inspector} pos={chatPosition.pos} onMove={chatPosition.move}
+          onClick={openChat} />
       )}
     </div>
   )

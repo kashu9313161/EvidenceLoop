@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { AiStatus, AskResult } from '../api'
-import { clampButton, panelPlacement, parsePosition, type Point } from '../chatPosition'
+import { panelPlacement, type Point } from '../chatPosition'
 import { AnswerView, type AnswerActions } from './Answer'
 import { CloseIcon } from './bits'
 
@@ -13,40 +13,9 @@ export interface ChatMessage {
 
 const PROVIDER_NAMES: Record<string, string> = { gemini: 'Gemini', anthropic: 'Claude', fake: 'Demo' }
 
-const POSITION_KEY = 'el-chat-position'
 const KEY_STEP = 24
 
 const viewport = () => ({ width: window.innerWidth, height: window.innerHeight })
-
-/** Where the user has put the chat button (null: the default corner), kept between visits
- * and pulled back inside the window when it gets smaller. */
-export function useChatPosition() {
-  const [pos, setPos] = useState<Point | null>(() => {
-    try {
-      const saved = parsePosition(localStorage.getItem(POSITION_KEY))
-      return saved && clampButton(saved, viewport())
-    } catch {
-      return null
-    }
-  })
-  useEffect(() => {
-    const onResize = () => setPos((p) => p && clampButton(p, viewport()))
-    window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
-  }, [])
-  const move = useCallback((p: Point | null, save: boolean) => {
-    const next = p && clampButton(p, viewport())
-    setPos(next)
-    if (!save) return
-    try {
-      if (next) localStorage.setItem(POSITION_KEY, JSON.stringify(next))
-      else localStorage.removeItem(POSITION_KEY)
-    } catch {
-      /* private mode: the position lasts for this visit */
-    }
-  }, [])
-  return { pos, move }
-}
 
 interface ButtonProps {
   busy: boolean
@@ -128,6 +97,8 @@ export function ChatButton({ busy, shifted, pos, onMove, onClick }: ButtonProps)
 }
 
 interface PanelProps extends AnswerActions {
+  /** Where the button is: the panel opens from there (null: the default corner). */
+  anchor: Point | null
   repoName: string
   ai: AiStatus | null
   messages: ChatMessage[]
@@ -137,8 +108,10 @@ interface PanelProps extends AnswerActions {
   onClose: () => void
 }
 
-export function ChatPanel({ repoName, ai, messages, examples, onSend, onMinimise, onClose, onOpenCode,
+export function ChatPanel({ anchor, repoName, ai, messages, examples, onSend, onMinimise, onClose, onOpenCode,
   onShowInMap }: PanelProps) {
+  // Phones keep the full-screen sheet from the stylesheet.
+  const placed = anchor && window.innerWidth > 720 ? panelPlacement(anchor, viewport()) : null
   const [text, setText] = useState('')
   const latest = useRef<HTMLDivElement | null>(null)
   const field = useRef<HTMLInputElement | null>(null)
@@ -158,7 +131,9 @@ export function ChatPanel({ repoName, ai, messages, examples, onSend, onMinimise
   }
 
   return (
-    <section className="chat-panel" role="dialog" aria-label={`Ask about ${repoName}`}>
+    <section className="chat-panel" role="dialog" aria-label={`Ask about ${repoName}`}
+      style={placed ? { left: placed.left, top: placed.top, width: placed.width, height: placed.height,
+        right: 'auto', bottom: 'auto' } : undefined}>
       <header className="chat-head">
         <div>
           <h2>Ask about {repoName}</h2>

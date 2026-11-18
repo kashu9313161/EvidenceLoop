@@ -17,7 +17,7 @@ repository is ever run.
   and what it contributes, plus the functions to read first (each checked against the real code).
 - **Search and ask:** one box at the top right (Ctrl K) finds files, functions and text as you type, and answers
   lookups ("where is load_data", "what calls main", "which files use pandas") in place from the index, with no AI.
-  Anything else goes to the **AI chat** (the button at the bottom right): open questions ("how is the model
+  Anything else goes to the **AI chat** (the button at the bottom right; drag it anywhere): open questions ("how is the model
   trained?") are answered with claims that each cite code; every citation is checked and each claim is marked
   verified, not enough evidence, or rejected. "Show in map" lights up the cited files. Past questions are kept
   per repository.

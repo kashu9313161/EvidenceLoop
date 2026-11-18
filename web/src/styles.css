@@ -1957,6 +1957,19 @@ details.disclosure ul {
   transform: scale(1.06);
 }
 
+/* It can be dragged anywhere (touch included). */
+.chat-button {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.chat-button.dragging {
+  cursor: grabbing;
+  transition: none;
+  transform: scale(1.1);
+}
+
 /* Beside the details panel instead of on top of it. */
 .chat-button.shifted {
   right: calc(min(420px, 92vw) + 20px);
