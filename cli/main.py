@@ -3,6 +3,7 @@ import argparse
 import json
 from pathlib import Path
 
+from analysis.pipeline import AnalysisError, analyze_snapshot
 from ingestion.service import (
     IngestionError,
     ingest_github_repository,
@@ -28,9 +29,17 @@ def main():
     show_parser = commands.add_parser("snapshot")
     show_parser.add_argument("snapshot_id")
 
+    analyze_parser = commands.add_parser("analyze")
+    analyze_parser.add_argument("snapshot_id")
+
     args = parser.parse_args()
 
     try:
+        if args.command == "analyze":
+            result = analyze_snapshot(args.snapshot_id)
+            print(json.dumps(result, indent=2))
+            return
+
         if args.command == "ingest":
             if args.source.startswith("https://"):
                 result = ingest_github_repository(args.source)
@@ -61,6 +70,8 @@ def main():
 
     except IngestionError as exc:
         parser.exit(1, f"Ingestion error: {exc}\n")
+    except AnalysisError as exc:
+        parser.exit(1, f"Analysis error: {exc}\n")
 
 
 if __name__ == "__main__":

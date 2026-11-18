@@ -350,7 +350,7 @@ Planned commands (see the implementation plan): `analyze <snapshot_id>`, `ask <s
 | Ingestion hardening: two-phase validation, atomic extraction, security test suite, CI | ✅ Done |
 | App: Add repository, Snapshot overview, Coverage ledger, snapshot kept in the URL | ✅ Done |
 | Light and dark themes | ✅ Done |
-| Python syntax-tree analysis, JS/TS shallow analysis | 🔜 Milestone 2 |
+| Python syntax-tree analysis (symbols, imports, calls), JS/TS shallow analysis, full-text index | ✅ Done |
 | Knowledge graph with confirmed and inferred edges, plus graph signals | 🔜 Milestone 3 (week 2) |
 | Gate A: choose the evaluator (Jev or LLM judge) and calibrate thresholds | 🔜 Week 2, alongside M3 |
 | Obsidian-style graph page | 🔜 Milestone 4 (demo Dec 7) |

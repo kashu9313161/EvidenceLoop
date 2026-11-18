@@ -1,9 +1,10 @@
 import streamlit as st
 
+from app.components import analysis_metrics, run_analysis
 from app.data import snapshots_frame
 from app.state import set_active_snapshot
 from ingestion.service import IngestionError, ingest_github_repository, ingest_zip_bytes
-from storage.database import get_snapshot
+from storage.database import get_latest_analysis, get_snapshot
 
 st.caption(
     "EvidenceLoop turns a repository into an immutable snapshot pinned to an exact commit. "
@@ -54,7 +55,12 @@ if submitted:
                 st.session_state.pop("last_ingest", None)
                 st.error(str(exc), title="Could not ingest", icon=":material/gpp_bad:")
             else:
-                status.update(label="Snapshot ready", state="complete", expanded=False)
+                status.update(label="Analyzing code…")
+                analysis = run_analysis(result["snapshot_id"], status)
+                if analysis is None:
+                    status.update(label="Snapshot ready, analysis failed", state="error")
+                else:
+                    status.update(label="Snapshot analyzed", state="complete", expanded=False)
                 set_active_snapshot(result["snapshot_id"])
                 st.session_state["last_ingest"] = result
                 st.rerun()
@@ -78,6 +84,10 @@ if result:
                 st.metric("Files", counts["total_files"], border=True)
                 st.metric("Eligible for analysis", counts["eligible_files"], border=True)
                 st.metric("Skipped", counts["skipped_files"], border=True)
+
+        analysis = get_latest_analysis(result["snapshot_id"])
+        if analysis is not None:
+            analysis_metrics(analysis)
 
         with st.container(horizontal=True):
             st.page_link(

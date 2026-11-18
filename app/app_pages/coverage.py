@@ -1,28 +1,34 @@
 import streamlit as st
 
 from app.components import STATUS_STYLES
-from app.data import coverage_frame, coverage_summary_frame
+from app.data import STAGE_COLUMNS, coverage_frame, coverage_summary_frame, stage_frame
 from app.state import require_snapshot
 
 snapshot = require_snapshot()
 snapshot_id = snapshot["snapshot_id"]
 
 st.info(
-    "**Pending** files are eligible and waiting for analysis stages (Python AST, security, "
-    "complexity). **Skipped** files will not be analyzed, and the reason is shown. A clean "
-    "report only means something for files that were actually analyzed.",
+    "**Analyzed** code files went through the code stages (Python syntax tree, or JS/TS "
+    "imports). **Indexed** files (docs, config) are searchable but have no code analysis. "
+    "**Pending** files are waiting for analysis, **failed** ones show why, and **skipped** "
+    "files are never analyzed. A clean report only means something for files that were "
+    "actually analyzed.",
     title="Not analyzed is not the same as no issues",
     icon=":material/info:",
 )
 
 files = coverage_frame(snapshot_id)
 summary = coverage_summary_frame(snapshot_id)
+stages = stage_frame(snapshot_id)
+files = files.merge(stages, on="relative_path", how="left")
+files[list(STAGE_COLUMNS)] = files[list(STAGE_COLUMNS)].fillna("")
 
 with st.container(horizontal=True):
-    for status in ("pending", "skipped", "analyzed"):
+    for status in ("analyzed", "indexed", "failed", "pending", "skipped"):
         label = STATUS_STYLES[status][0]
         count = int(summary.loc[summary["status"] == status, "files"].sum())
-        st.metric(label, count, border=True)
+        if count or status in {"analyzed", "skipped"}:
+            st.metric(label, count, border=True)
 
 skipped = summary[summary["status"] == "skipped"]
 if not skipped.empty:
@@ -69,18 +75,19 @@ st.caption(f"Showing {len(view)} of {len(files)} files")
 st.dataframe(
     view.assign(status=view["status"].map(lambda s: STATUS_STYLES.get(s, (s,))[0])),
     hide_index=True,
-    column_order=["relative_path", "status", "skip_reason", "size_bytes"],
+    column_order=["relative_path", "status", *STAGE_COLUMNS, "skip_reason", "size_bytes"],
     column_config={
-        "relative_path": st.column_config.TextColumn("Path", width="large"),
+        "relative_path": st.column_config.TextColumn("Path", width="medium"),
         "status": st.column_config.TextColumn("Status"),
-        "skip_reason": st.column_config.TextColumn("Skip reason"),
+        **{stage: st.column_config.TextColumn(label) for stage, label in STAGE_COLUMNS.items()},
+        "skip_reason": st.column_config.TextColumn("Reason"),
         "size_bytes": st.column_config.NumberColumn("Size", format="bytes"),
     },
     key="coverage_table",
-    alt="Coverage ledger: every file with its analysis status and skip reason",
+    alt="Coverage ledger: every file with its status, per-stage results and reason",
 )
 
 st.caption(
-    "Per-stage columns (Python AST, security, complexity) will appear here as each "
-    "analysis stage lands in Milestones 2–4."
+    "Stage columns show each analysis step per file; an empty cell means the step doesn't "
+    "apply. Security, complexity and history stages arrive in Milestone 7."
 )

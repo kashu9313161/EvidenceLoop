@@ -24,10 +24,11 @@ For what EvidenceLoop is and how it works, see [PROJECT_GUIDE.md](PROJECT_GUIDE.
 |---|---|
 | M1 ingestion: GitHub API with commit SHA, ZIP, SQLite, coverage | Done |
 | M1.5 hardening: two-phase validation, atomic extraction, 60 security tests, CI | Done, commit `79b892a` on `m1.5-ingestion-hardening` |
-| Streamlit shell: Add repository, Overview, Coverage, placeholders, snapshot in URL | Done, uncommitted. Commit before M2 |
-| Step 0: docs (this plan, project guide, README, CLAUDE.md status) | Done, uncommitted |
-| Step 0b: light and dark themes | Done, uncommitted (86 tests pass) |
-| Schema: `files_fts`, `graph_nodes`, `graph_edges` | Tables exist, empty |
+| Streamlit shell: Add repository, Overview, Coverage, placeholders, snapshot in URL | Done, commit `dbdcfbb` |
+| Step 0: docs (this plan, project guide, README, CLAUDE.md status) | Done, commit `dbdcfbb` |
+| Step 0b: light and dark themes | Done, commit `dbdcfbb` |
+| M2 code analysis: Python symbols, imports and calls; JS/TS imports and exports; full-text index; stage columns | Done (111 tests pass) |
+| Schema: `graph_nodes`, `graph_edges` | Tables exist, empty until M3 |
 | `analysis`, `retrieval`, `verification`, `intelligence`, `obsidian` packages | Empty |
 
 Prototype code to port from `PROJECTS/evidenceloop/evidenceloop/`:
@@ -107,7 +108,7 @@ The defaults for thresholds, caps and evidence size are starting points. Adjust 
 **Goal:** the repository explains itself before more code lands.
 
 **Tasks**
-- [ ] Commit the current UI work.
+- [x] Commit the current UI work.
 - [x] `README.md`: pitch, quick start, links to both docs.
 - [x] `docs/PROJECT_GUIDE.md`: pitch, problem, how it works, glossary, security and privacy (with the real ZIP limits from `core/config.py`), configuration, how to run, status table. *(Already written in full, including the graph, asking, review and FAQ sections. Each milestone updates its section when it ships.)*
 - [x] `docs/IMPLEMENTATION_PLAN.md`: this plan, exported to Markdown.
@@ -129,22 +130,24 @@ The defaults for thresholds, caps and evidence size are starting points. Adjust 
 
 **Tests:** AppTest smoke run. The config parses and contains both theme sections (`tests/test_theme_config.py`).
 
-### M2: code analysis (week 1)
+### M2: code analysis (week 1). Done
 
 **Goal:** turn each pending file into symbols with exact line ranges.
 
 **Tasks**
-- [ ] `analysis/python/extractor.py`: `extract_file(path, source)` returns `FileFacts`.
+- [x] `analysis/python/extractor.py`: `extract_file(path, source)` returns `FileFacts`.
   - Symbols: module, class, function, method. Each with name, qualified name, line range, decorators, bases and whether it has a docstring.
   - Imports: module, names, alias, line.
   - Calls: callee text, line, enclosing symbol.
   - Port the chunking rules.
   - A `SyntaxError` marks the file `failed` with a reason.
-- [ ] `analysis/javascript/shallow.py`: `import`, `require` and `export` for `.js .jsx .ts .tsx .mjs .cjs`.
-- [ ] `analysis/models.py`: Pydantic models `Symbol`, `ImportRef`, `CallRef`, `FileFacts`.
-- [ ] Full-text: insert file text into `files_fts`, and add `symbols_fts`.
-- [ ] `analysis/pipeline.py`: `analyze_snapshot(snapshot_id)`. It's idempotent: it deletes that snapshot's rows and rewrites them in one transaction.
-- [ ] CLI `analyze` command. An Analyze button with progress on the Overview page.
+- [x] `analysis/javascript/shallow.py`: `import`, `require` and `export` for `.js .jsx .ts .tsx .mjs .cjs`.
+- [x] `analysis/models.py`: Pydantic models `Symbol`, `ImportRef`, `CallRef`, `FileFacts`.
+- [x] Full-text: insert file text into `files_fts`, and add `symbols_fts`.
+- [x] `analysis/pipeline.py`: `analyze_snapshot(snapshot_id)`. It's idempotent: it deletes that snapshot's rows and rewrites them in one transaction.
+- [x] CLI `analyze` command. An Analyze button with progress on the Overview page.
+- [x] Home runs analysis right after ingesting. Overview shows a code-structure browser (file → symbols with line ranges, imports, code view).
+- [x] New file status `indexed`: docs and config are searchable but get no code analysis, so they are never counted as "analyzed".
 
 **Data**
 - `file_stages(snapshot_id, relative_path, stage, status, reason)`. Stages: `python_ast`, `js_shallow`, `fts`, `graph`, `scanners`, `history`.

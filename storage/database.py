@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -82,6 +83,96 @@ CREATE TABLE IF NOT EXISTS graph_edges (
     FOREIGN KEY (snapshot_id)
         REFERENCES snapshots(snapshot_id)
 );
+
+-- M2: code analysis --------------------------------------------------------
+
+-- One row per (file, stage). Stages: python_ast, js_shallow, fts (later: graph,
+-- scanners, history). status: analyzed | failed | not_applicable.
+CREATE TABLE IF NOT EXISTS file_stages (
+    snapshot_id TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    PRIMARY KEY (snapshot_id, relative_path, stage),
+    FOREIGN KEY (snapshot_id)
+        REFERENCES snapshots(snapshot_id)
+);
+
+CREATE TABLE IF NOT EXISTS symbols (
+    snapshot_id TEXT NOT NULL,
+    symbol_id TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    module TEXT,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    parent TEXT,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    decorators TEXT NOT NULL DEFAULT '[]',
+    bases TEXT NOT NULL DEFAULT '[]',
+    has_docstring INTEGER NOT NULL DEFAULT 0,
+    is_async INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (snapshot_id, symbol_id),
+    FOREIGN KEY (snapshot_id)
+        REFERENCES snapshots(snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbols_path
+ON symbols(snapshot_id, relative_path);
+
+CREATE TABLE IF NOT EXISTS imports (
+    import_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    module TEXT NOT NULL,
+    name TEXT,
+    alias TEXT,
+    level INTEGER NOT NULL DEFAULT 0,
+    line INTEGER NOT NULL,
+    FOREIGN KEY (snapshot_id)
+        REFERENCES snapshots(snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_imports_path
+ON imports(snapshot_id, relative_path);
+
+CREATE TABLE IF NOT EXISTS calls (
+    call_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    callee TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    enclosing_symbol TEXT,
+    FOREIGN KEY (snapshot_id)
+        REFERENCES snapshots(snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_calls_path
+ON calls(snapshot_id, relative_path);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
+    snapshot_id UNINDEXED,
+    symbol_id UNINDEXED,
+    qualified_name,
+    path,
+    start_line UNINDEXED,
+    end_line UNINDEXED,
+    text
+);
+
+-- One row per analysis run that finished (latest wins in the UI).
+CREATE TABLE IF NOT EXISTS analysis_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    analyzer_version TEXT NOT NULL,
+    finished_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    summary TEXT NOT NULL,
+    FOREIGN KEY (snapshot_id)
+        REFERENCES snapshots(snapshot_id)
+);
 """
 
 
@@ -160,4 +251,111 @@ def get_coverage_summary(snapshot_id: str) -> list[sqlite3.Row]:
             ORDER BY files DESC
             """,
             (snapshot_id,),
+        ).fetchall()
+
+
+def get_latest_analysis(snapshot_id: str) -> dict | None:
+    """Summary of the most recent analysis run for a snapshot, or None if never analyzed."""
+    initialize_database()
+
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT run_id, analyzer_version, finished_at, summary
+            FROM analysis_runs
+            WHERE snapshot_id = ?
+            ORDER BY run_id DESC
+            LIMIT 1
+            """,
+            (snapshot_id,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "run_id": row["run_id"],
+        "analyzer_version": row["analyzer_version"],
+        "finished_at": row["finished_at"],
+        **json.loads(row["summary"]),
+    }
+
+
+def get_file_stages(snapshot_id: str) -> list[sqlite3.Row]:
+    initialize_database()
+
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT relative_path, stage, status, reason
+            FROM file_stages
+            WHERE snapshot_id = ?
+            ORDER BY relative_path, stage
+            """,
+            (snapshot_id,),
+        ).fetchall()
+
+
+def list_symbols(snapshot_id: str, relative_path: str | None = None) -> list[sqlite3.Row]:
+    initialize_database()
+
+    query = """
+        SELECT symbol_id, relative_path, module, kind, name, qualified_name, parent,
+               start_line, end_line, decorators, bases, has_docstring, is_async
+        FROM symbols
+        WHERE snapshot_id = ?
+    """
+    params: list = [snapshot_id]
+
+    if relative_path is not None:
+        query += " AND relative_path = ?"
+        params.append(relative_path)
+
+    query += " ORDER BY relative_path, start_line, end_line DESC"
+
+    with get_connection() as connection:
+        return connection.execute(query, params).fetchall()
+
+
+def list_imports(snapshot_id: str, relative_path: str | None = None) -> list[sqlite3.Row]:
+    initialize_database()
+
+    query = """
+        SELECT relative_path, kind, module, name, alias, level, line
+        FROM imports
+        WHERE snapshot_id = ?
+    """
+    params: list = [snapshot_id]
+
+    if relative_path is not None:
+        query += " AND relative_path = ?"
+        params.append(relative_path)
+
+    query += " ORDER BY relative_path, line, import_id"
+
+    with get_connection() as connection:
+        return connection.execute(query, params).fetchall()
+
+
+def search_symbols(snapshot_id: str, text: str, limit: int = 50) -> list[sqlite3.Row]:
+    """Full-text search over symbol names, paths and source text."""
+    terms = [term for term in text.replace('"', " ").split() if term]
+    if not terms:
+        return []
+
+    # Quote every term so FTS5 operators in user input are treated as plain words.
+    match = " ".join(f'"{term}"*' for term in terms)
+
+    initialize_database()
+
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT symbol_id, qualified_name, path, start_line, end_line
+            FROM symbols_fts
+            WHERE symbols_fts MATCH ? AND snapshot_id = ?
+            ORDER BY rank
+            LIMIT ?
+            """,
+            (match, snapshot_id, limit),
         ).fetchall()

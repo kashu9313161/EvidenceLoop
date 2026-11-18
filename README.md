@@ -25,6 +25,7 @@ Run the checks with `ruff check .` and `pytest -q`. The tests run fully offline.
 
 ## Status
 
-Ingestion, ingestion hardening and the app shell (add a repository, snapshot overview, coverage ledger, light and
-dark themes) are done. Next up: Python code analysis, the knowledge graph, and the Obsidian-style graph page.
+Ingestion, ingestion hardening, the app shell (add a repository, snapshot overview, coverage ledger, light and
+dark themes) and code analysis (Python symbols, imports and calls; JS/TS imports and exports; full-text search
+index) are done. Next up: the knowledge graph, then the Obsidian-style graph page.
 See the [implementation plan](docs/IMPLEMENTATION_PLAN.md) for everything after that.

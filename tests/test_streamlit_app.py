@@ -121,3 +121,37 @@ def test_snapshot_survives_reload_via_query_param(isolated_storage):
 
     assert not at.exception
     assert at.session_state["snapshot"] == first_id
+
+
+def test_ingest_runs_analysis_and_overview_shows_code_structure(isolated_storage):
+    files = {
+        "proj/pkg/core.py": b"import os\n\n\nclass Engine:\n    def run(self):\n        return 1\n",
+        "proj/README.md": b"# hi\n",
+    }
+    at = ingest_zip_through_ui(new_app(), files)
+
+    assert not at.exception
+    labels = {m.label: m.value for m in at.metric}
+    assert labels["Code files analyzed"] == "1"
+    assert labels["Indexed for search"] == "1"
+    assert labels["Symbols"] == "3"  # module, Engine, Engine.run
+
+    at.switch_page("app_pages/overview.py").run()
+
+    assert not at.exception
+    snapshot_id = at.session_state["snapshot"]
+    assert at.selectbox(key=f"overview_file_{snapshot_id}").value == "pkg/core.py"
+    symbols = at.dataframe[-2].value
+    assert list(symbols["qualified_name"]) == ["Engine", "Engine.run"]
+    assert at.button(key="overview_analyze").label == "Re-run analysis"
+
+    at.button(key="overview_analyze").click().run()
+    assert not at.exception
+
+    at.switch_page("app_pages/coverage.py").run()
+
+    assert not at.exception
+    table = at.dataframe[-1].value.set_index("relative_path")
+    assert table.loc["pkg/core.py", "python_ast"] == "analyzed"
+    assert table.loc["README.md", "fts"] == "analyzed"
+    assert table.loc["README.md", "status"] == "Indexed for search"

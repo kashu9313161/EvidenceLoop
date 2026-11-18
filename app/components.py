@@ -12,6 +12,7 @@ STATUS_STYLES: dict[str, tuple[str, str, str]] = {
     "pending": ("Pending analysis", "gray", ":material/schedule:"),
     "skipped": ("Skipped", "orange", ":material/block:"),
     "analyzed": ("Analyzed", "green", ":material/check_circle:"),
+    "indexed": ("Indexed for search", "blue", ":material/manage_search:"),
     "failed": ("Analysis failed", "red", ":material/error:"),
     # claim verification
     "verified": ("Verified", "green", ":material/verified:"),
@@ -94,6 +95,39 @@ def evidence_card(
                 st.caption(f"Snapshot `{ref.snapshot_id}`")
                 if snapshot_root is not None:
                     code_view(snapshot_root, ref.path, ref.start_line, ref.end_line)
+
+
+def run_analysis(snapshot_id: str, container) -> dict | None:
+    """Analyze a snapshot with a progress bar inside `container` (e.g. an st.status).
+
+    Returns the summary, or None after showing the error.
+    """
+    from analysis.pipeline import AnalysisError, analyze_snapshot
+
+    bar = container.progress(0.0, text="Reading files…")
+
+    def on_progress(done: int, total: int, path: str) -> None:
+        bar.progress(done / total if total else 1.0, text=f"{done}/{total} · `{path}`")
+
+    try:
+        summary = analyze_snapshot(snapshot_id, progress=on_progress)
+    except AnalysisError as exc:
+        bar.empty()
+        container.error(str(exc), title="Analysis failed", icon=":material/error:")
+        return None
+
+    bar.progress(1.0, text=f"Analyzed {summary['files']} files in {summary['seconds']} s")
+    return summary
+
+
+def analysis_metrics(summary: dict) -> None:
+    """Headline numbers from an analysis run."""
+    with st.container(horizontal=True):
+        st.metric("Code files analyzed", summary["analyzed"], border=True)
+        st.metric("Indexed for search", summary["indexed"], border=True)
+        st.metric("Failed", summary["failed"], border=True)
+        st.metric("Symbols", summary["symbols"], border=True)
+        st.metric("Imports", summary["imports"], border=True)
 
 
 def coming_soon(milestone: str, summary: str, planned: Sequence[str]) -> None:
