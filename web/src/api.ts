@@ -334,6 +334,15 @@ export interface AskResult {
   created_at: string
 }
 
+export type AiStatus =
+  | { available: false; reason: string }
+  | {
+      available: true
+      provider: string
+      model: string
+      judge: { kind: string; provider: string | null; model: string | null }
+    }
+
 export interface SearchResult {
   files: string[]
   symbols: { name: string; path: string; start: number; end: number }[]
@@ -389,6 +398,13 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ snapshot, question }),
     }),
+  /** A lookup answered from the index as you type (no AI, nothing stored). */
+  lookup: (snapshot: string, text: string) =>
+    request<AskResult | { kind: 'analytical' }>(`/api/lookup?snapshot=${q(snapshot)}&q=${q(text)}`),
+  /** Recent questions and answers for this repository, newest first. */
+  asks: (snapshot: string) => request<AskResult[]>(`/api/asks?snapshot=${q(snapshot)}`),
+  /** Which models answer and judge. */
+  ai: () => request<AiStatus>('/api/ai'),
   /** The cached AI explanation of a file; never calls the model. */
   explanation: (snapshot: string, path: string) =>
     request<ExplainResponse>(`/api/explain?snapshot=${q(snapshot)}&path=${q(path)}`),

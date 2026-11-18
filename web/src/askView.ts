@@ -1,4 +1,21 @@
-import type { AskClaim, AskResult } from './api'
+import type { AskClaim, AskResult, Report } from './api'
+
+/** Three starter questions built from this repository: two lookups and one open question. */
+export function exampleQuestions(report: Report): string[] {
+  const code = report.files
+    .filter((f) => !f.is_test && f.status === 'analyzed' && f.loc > 0)
+    .sort((a, b) => b.importance - a.importance)
+  const withFunctions = code.find((f) => f.function_metrics.length > 0)
+  const out: string[] = []
+  if (withFunctions) {
+    const fn = [...withFunctions.function_metrics].sort((a, b) => b.complexity - a.complexity)[0]
+    const name = fn.name.split('.').pop() ?? fn.name
+    out.push(`where is ${name}`, `what calls ${name}`)
+  }
+  const key = code[0]
+  if (key) out.push(`How does ${key.name.replace(/\.[^.]+$/, '')} work?`)
+  return out.length ? out : ['How is this project organised?']
+}
 
 export const STATUS_LABEL = { verified: 'Verified', insufficient: 'Not enough evidence', rejected: 'Rejected' }
 

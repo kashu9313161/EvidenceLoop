@@ -209,7 +209,8 @@ CREATE TABLE IF NOT EXISTS asks (
     model TEXT,
     usage TEXT NOT NULL,
     evidence TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    meta TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_asks_snapshot ON asks(snapshot_id);
@@ -277,9 +278,18 @@ def get_connection() -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+# Columns added after a table first shipped: (table, column, definition). CREATE TABLE IF NOT
+# EXISTS leaves an existing table alone, so these are added on start-up when missing.
+ADDED_COLUMNS = [("asks", "meta", "TEXT NOT NULL DEFAULT '{}'")]
+
+
 def initialize_database() -> None:
     with get_connection() as connection:
         connection.executescript(SCHEMA)
+        for table, column, definition in ADDED_COLUMNS:
+            have = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def get_snapshot(snapshot_id: str):

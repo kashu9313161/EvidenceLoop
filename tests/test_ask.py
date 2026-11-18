@@ -447,3 +447,81 @@ def test_api_refuses_bad_questions_and_other_sites(client, shop):
     foreign = client.post("/api/ask", json={"snapshot": shop, "question": "where is total"},
                           headers={"Origin": "https://evil.example"})
     assert foreign.status_code == 403
+
+
+# --------------------------------------------------------------------------- command box, chat
+
+
+def test_answer_lookup_is_free_and_unsaved(shop):
+    from intelligence.ask import answer_lookup
+
+    found = answer_lookup(shop, "where is place_order")
+    assert found["kind"] == "lookup" and found["claims"][0]["status"] == VERIFIED
+    assert answer_lookup(shop, "how are orders priced?") is None
+    assert rows("asks") == []  # nothing stored while typing
+
+
+def test_api_lookup_answers_as_you_type(client, shop, monkeypatch):
+    provider = FakeProvider(error="must not be called")
+    monkeypatch.setattr(api_main, "ask_providers", lambda: (provider, provider))
+    got = client.get("/api/lookup", params={"snapshot": shop, "q": "what calls place_order"})
+    assert got.status_code == 200 and got.json()["lookup"] == "callers"
+    open_question = client.get("/api/lookup", params={"snapshot": shop, "q": "how does it work"})
+    assert open_question.json() == {"kind": "analytical"}
+    assert provider.calls == [] and rows("asks") == []
+
+
+def test_api_ai_describes_the_models_without_the_key(client, monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "EL_PROVIDER",
+                 "EL_MODEL_ASK", "EL_MODEL_JUDGE"):
+        monkeypatch.delenv(name, raising=False)
+    off = client.get("/api/ai").json()
+    assert off["available"] is False and "GEMINI_API_KEY" in off["reason"]
+
+    monkeypatch.setenv("GEMINI_API_KEY", "g-secret-key")
+    on = client.get("/api/ai").json()
+    assert on == {"available": True, "provider": "gemini", "model": "gemini-3.5-flash-lite",
+                  "judge": {"kind": "llm", "provider": "gemini",
+                            "model": "gemini-3.5-flash-lite"}}
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a-secret-key")
+    assert client.get("/api/ai").json()["provider"] == "anthropic"
+    assert "secret" not in client.get("/api/ai").text
+
+
+def test_history_round_trips_newest_first(client, shop, monkeypatch):
+    provider = answer_citing(("place_order prices the order.", ["E1"]),
+                             ("Made up.", ["E99"]))
+    judge = FakeProvider({"support": 0.9, "contradiction": 0.0, "sufficiency": 0.9,
+                          "reason": "ok"})
+    monkeypatch.setattr(api_main, "ask_providers", lambda: (provider, judge))
+    first = client.post("/api/ask", json={"snapshot": shop, "question": "where is total"}).json()
+    second = client.post("/api/ask", json={"snapshot": shop,
+                                           "question": "how are orders priced?"}).json()
+
+    history = client.get("/api/asks", params={"snapshot": shop}).json()
+    assert [h["id"] for h in history] == [second["id"], first["id"]]
+    again = history[0]
+    for key in ("question", "kind", "lookup", "route", "status", "summary", "more", "evidence",
+                "usage", "provider", "model", "thresholds"):
+        assert again[key] == second[key], key
+    assert [(c["text"], c["status"], c["evidence_ids"]) for c in again["claims"]] == \
+        [(c["text"], c["status"], c["evidence_ids"]) for c in second["claims"]]
+    assert again["claims"][0]["judgment"]["support"] == 0.9
+    assert again["claims"][1]["judgment"] is None  # rejected before judging
+    assert len(client.get("/api/asks", params={"snapshot": shop, "limit": 1}).json()) == 1
+
+
+def test_an_older_database_gains_the_new_column(isolated_storage):
+    from storage.database import initialize_database
+
+    connection = sqlite3.connect(config.DATABASE_PATH)
+    connection.execute("CREATE TABLE asks (ask_id TEXT PRIMARY KEY, snapshot_id TEXT NOT NULL, "
+                       "question TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, "
+                       "summary TEXT NOT NULL, provider TEXT, model TEXT, usage TEXT NOT NULL, "
+                       "evidence TEXT NOT NULL, created_at TEXT NOT NULL)")
+    connection.close()
+    initialize_database()
+    initialize_database()  # and again, harmlessly
+    columns = [r[1] for r in sqlite3.connect(config.DATABASE_PATH).execute(
+        "PRAGMA table_info(asks)")]
+    assert columns.count("meta") == 1

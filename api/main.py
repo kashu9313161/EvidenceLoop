@@ -33,7 +33,7 @@ from ingestion.service import (
     ingest_zip_bytes,
     parse_github_url,
 )
-from intelligence.ask import AskError
+from intelligence.ask import AskError, answer_lookup, load_asks
 from intelligence.ask import ask as run_ask
 from intelligence.providers import Provider, ProviderError, ai_status, provider_for
 from storage.database import (
@@ -354,6 +354,35 @@ def ask_question(request: AskRequest) -> dict:
                        judge_provider=judge)
     except AskError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/lookup")
+def lookup(snapshot: str = Query(...), q: str = Query(...)) -> dict:
+    """A lookup answered from the index as you type: no AI, nothing stored. Anything else
+    comes back as {"kind": "analytical"}."""
+    _require_snapshot(snapshot)
+    try:
+        return answer_lookup(snapshot, q) or {"kind": "analytical"}
+    except AskError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/asks")
+def recent_asks(snapshot: str = Query(...), limit: int = Query(20, ge=1, le=100)) -> list[dict]:
+    """The repository's recent questions and answers, newest first."""
+    _require_snapshot(snapshot)
+    return load_asks(snapshot, limit)
+
+
+@app.get("/api/ai")
+def ai_info() -> dict:
+    """Which models answer and judge, for the chat header. Never includes a key."""
+    answer, judge = ask_providers()
+    if answer is None:
+        return {"available": False, "reason": ai_status()[1] or "AI isn't available."}
+    return {"available": True, "provider": answer.name, "model": answer.model,
+            "judge": {"kind": "llm", "provider": judge.name if judge else None,
+                      "model": judge.model if judge else None}}
 
 
 # --------------------------------------------------------------------------- explanations

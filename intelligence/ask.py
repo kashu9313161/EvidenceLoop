@@ -101,42 +101,27 @@ def _index_claims(claims: list[dict], package: dict[str, EvidenceItem],
     return results
 
 
-def ask(snapshot_id: str, question: str, answer_provider: Provider | None = None,
-        judge_provider: Provider | None = None, evaluator: Evaluator | None = None,
-        budget: Budget | None = None, thresholds: Thresholds | None = None) -> dict:
+def _clean_question(question: str) -> str:
     question = " ".join(question.split())
     if not question:
         raise AskError("Type a question first.")
     if len(question) > MAX_QUESTION_CHARS:
         raise AskError(f"Keep the question under {MAX_QUESTION_CHARS} characters.")
+    return question
+
+
+def _report_for(snapshot_id: str) -> dict:
     report = load_report(snapshot_id)
     if report is None:
         raise AskError("This repository needs to be analysed again before you can ask about it.")
+    return report
 
-    files = SnapshotFiles(snapshot_id)
-    thresholds = thresholds or Thresholds.from_env()
-    metered = Metered(budget)
-    route = route_question(question)
-    claims: list[ClaimResult] = []
-    evidence: list[EvidenceItem] = []
-    status, summary, more = "answered", "", 0
 
-    if route.kind == "lookup":
-        found = LOOKUPS[route.lookup](snapshot_id, route.target, report, files)
-        if found.claims or answer_provider is None:
-            evidence, summary, more = found.evidence, found.summary, found.more
-            claims = _index_claims(found.claims, {e.id: e for e in evidence}, files)
-        else:
-            # Nothing by that name: the question may not have been a lookup after all.
-            route = Route("analytical", reason=f"Nothing is named `{route.target}`, so it was "
-                                               f"answered as an open question.")
-
-    if route.kind == "analytical":
-        status, summary, evidence, claims = _analytical(
-            snapshot_id, question, report, files, answer_provider, judge_provider, evaluator,
-            metered, thresholds)
-
-    result = {
+def _result(snapshot_id: str, question: str, route: Route, status: str, summary: str,
+            claims: list[ClaimResult], evidence: list[EvidenceItem], usage: dict,
+            provider: Provider | None, thresholds: Thresholds, more: int = 0) -> dict:
+    analytical = route.kind == "analytical" and provider is not None
+    return {
         "id": uuid.uuid4().hex[:16],
         "snapshot_id": snapshot_id,
         "question": question,
@@ -148,14 +133,55 @@ def ask(snapshot_id: str, question: str, answer_provider: Provider | None = None
         "more": more,
         "claims": [c.to_dict() for c in claims],
         "evidence": [e.to_dict() for e in evidence],
-        "usage": metered.budget.summary(),
-        "provider": answer_provider.name if answer_provider and route.kind == "analytical"
-        else None,
-        "model": answer_provider.model if answer_provider and route.kind == "analytical"
-        else None,
+        "usage": usage,
+        "provider": provider.name if analytical else None,
+        "model": provider.model if analytical else None,
         "thresholds": thresholds.to_dict(),
         "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
+
+
+def answer_lookup(snapshot_id: str, question: str,
+                  thresholds: Thresholds | None = None) -> dict | None:
+    """A lookup answered from the index: no AI, nothing stored. None when the question isn't a
+    lookup. The command box calls this as you type."""
+    question = _clean_question(question)
+    route = route_question(question)
+    if route.kind != "lookup":
+        return None
+    report = _report_for(snapshot_id)
+    files = SnapshotFiles(snapshot_id)
+    found = LOOKUPS[route.lookup](snapshot_id, route.target, report, files)
+    claims = _index_claims(found.claims, {e.id: e for e in found.evidence}, files)
+    return _result(snapshot_id, question, route, "answered", found.summary, claims,
+                   found.evidence, Budget().summary(), None,
+                   thresholds or Thresholds.from_env(), found.more)
+
+
+def ask(snapshot_id: str, question: str, answer_provider: Provider | None = None,
+        judge_provider: Provider | None = None, evaluator: Evaluator | None = None,
+        budget: Budget | None = None, thresholds: Thresholds | None = None) -> dict:
+    question = _clean_question(question)
+    report = _report_for(snapshot_id)
+    thresholds = thresholds or Thresholds.from_env()
+
+    looked = answer_lookup(snapshot_id, question, thresholds)
+    if looked is not None and (looked["claims"] or answer_provider is None):
+        save_ask(looked)
+        return looked
+    route = route_question(question)
+    if looked is not None:
+        # Nothing by that name: the question may not have been a lookup after all.
+        route = Route("analytical", reason=f"Nothing is named `{route.target}`, so it was "
+                                           f"answered as an open question.")
+
+    files = SnapshotFiles(snapshot_id)
+    metered = Metered(budget)
+    status, summary, evidence, claims = _analytical(
+        snapshot_id, question, report, files, answer_provider, judge_provider, evaluator,
+        metered, thresholds)
+    result = _result(snapshot_id, question, route, status, summary, claims, evidence,
+                     metered.budget.summary(), answer_provider, thresholds)
     save_ask(result)
     record_sends(snapshot_id, result["id"], metered.sends)
     return result
@@ -203,11 +229,12 @@ def save_ask(result: dict) -> None:
     with get_connection() as connection:
         connection.execute(
             "INSERT INTO asks (ask_id, snapshot_id, question, kind, status, summary, provider, "
-            "model, usage, evidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "model, usage, evidence, created_at, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (result["id"], result["snapshot_id"], result["question"], result["kind"],
              result["status"], result["summary"], result["provider"], result["model"],
              json.dumps(result["usage"]), json.dumps(result["evidence"]),
-             result["created_at"]),
+             result["created_at"],
+             json.dumps({k: result[k] for k in ("lookup", "route", "more", "thresholds")})),
         )
         for index, claim in enumerate(result["claims"]):
             judgment = claim["judgment"] or {}
@@ -228,3 +255,58 @@ def save_ask(result: dict) -> None:
                   by_id.get(eid, {}).get("end"), by_id.get(eid, {}).get("sha256"))
                  for eid in claim["evidence_ids"]],
             )
+
+
+def load_asks(snapshot_id: str, limit: int = 20) -> list[dict]:
+    """The repository's recent questions, newest first, in the shape `ask` returns."""
+    initialize_database()
+    with get_connection() as connection:
+        asks = connection.execute(
+            "SELECT * FROM asks WHERE snapshot_id = ? ORDER BY created_at DESC, rowid DESC "
+            "LIMIT ?", (snapshot_id, limit)).fetchall()
+        out = []
+        for row in asks:
+            claims = connection.execute(
+                "SELECT * FROM ask_claims WHERE ask_id = ? ORDER BY claim_index",
+                (row["ask_id"],)).fetchall()
+            cited: dict[int, list[str]] = {}
+            for link in connection.execute(
+                    "SELECT claim_index, evidence_id FROM ask_claim_evidence WHERE ask_id = ? "
+                    "ORDER BY rowid", (row["ask_id"],)):
+                cited.setdefault(link["claim_index"], []).append(link["evidence_id"])
+            meta = json.loads(row["meta"] or "{}")
+            out.append({
+                "id": row["ask_id"],
+                "snapshot_id": row["snapshot_id"],
+                "question": row["question"],
+                "kind": row["kind"],
+                "lookup": meta.get("lookup"),
+                "route": meta.get("route", ""),
+                "status": row["status"],
+                "summary": row["summary"],
+                "more": meta.get("more", 0),
+                "claims": [_stored_claim(c, cited.get(c["claim_index"], [])) for c in claims],
+                "evidence": json.loads(row["evidence"]),
+                "usage": json.loads(row["usage"]),
+                "provider": row["provider"],
+                "model": row["model"],
+                "thresholds": meta.get("thresholds") or Thresholds().to_dict(),
+                "created_at": row["created_at"],
+            })
+    return out
+
+
+def _stored_claim(row, evidence_ids: list[str]) -> dict:
+    judged = row["evaluator"] is not None and row["support"] is not None
+    return {
+        "text": row["text"],
+        "evidence_ids": evidence_ids,
+        "status": row["status"],
+        "reason": row["reason"],
+        "checks": json.loads(row["checks"]),
+        "judgment": {
+            "support": row["support"], "contradiction": row["contradiction"],
+            "sufficiency": row["sufficiency"], "evaluator": row["evaluator"],
+            "model_version": row["model_version"], "reason": "",
+        } if judged else None,
+    }

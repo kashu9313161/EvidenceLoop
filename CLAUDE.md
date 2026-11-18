@@ -19,7 +19,10 @@ calls, imports, graph; no AI) and everything else through `retrieval/evidence.py
 the answering model, then `verification/checks.py` (citation checks, then an `intelligence/evaluators` evaluator;
 `LlmJudgeEvaluator` now, Jev later behind the same protocol). Provider calls go through `intelligence/sendlog.Metered`
 (per-question `Budget`, logged to `provider_sends`); results go to `asks`, `ask_claims`, `ask_claim_evidence`. Tests use
-`FakeProvider` and a fixed evaluator. What's next is in `docs/IMPLEMENTATION_PLAN.md`; how it works is in
+`FakeProvider` and a fixed evaluator. In the UI, `CommandBox` (top right) calls `/api/search` and `GET /api/lookup`
+(`answer_lookup`: no AI, nothing stored) as you type; `Chat` (bottom right) posts to `/api/ask`, loads history from
+`/api/asks` and shows models from `/api/ai`; both render answers with `Answer.tsx`. New columns on existing tables go in
+`ADDED_COLUMNS` in `storage/database.py`. What's next is in `docs/IMPLEMENTATION_PLAN.md`; how it works is in
 `docs/PROJECT_GUIDE.md`.
 
 When the report's shape changes, bump `REPORT_VERSION` in `report.py` so stored reports are rebuilt, and keep

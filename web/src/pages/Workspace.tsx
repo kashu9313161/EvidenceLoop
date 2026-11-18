@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { api, type Report, workspacePath } from '../api'
-import { AskBox, AskPanel, type AskState } from '../components/Ask'
+import { type AiStatus, api, type Report, workspacePath } from '../api'
+import { exampleQuestions } from '../askView'
 import { Logo, ThemeToggle } from '../components/bits'
+import { ChatButton, type ChatMessage, ChatPanel } from '../components/Chat'
+import { CommandBox } from '../components/CommandBox'
 import { Files } from '../components/Files'
 import { Inspector } from '../components/Inspector'
 import { Issues } from '../components/Issues'
 import { MapView } from '../components/MapView'
 import { Overview } from '../components/Overview'
-import { SearchBox } from '../components/SearchBox'
 
 const TABS = [
   { id: 'overview', label: 'Overview' },
@@ -25,9 +26,13 @@ export function Workspace() {
   const [report, setReport] = useState<Report | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [impactOn, setImpactOn] = useState(false)
-  const [asked, setAsked] = useState<AskState | null>(null)
   const [cited, setCited] = useState<string[] | null>(null)
-  const askNumber = useRef(0)
+  const [chat, setChat] = useState<'closed' | 'open' | 'minimised'>('closed')
+  // Messages belong to one repository; switching repositories starts a fresh log.
+  const [chatLog, setChatLog] = useState<{ snapshot: string; messages: ChatMessage[] }>({ snapshot: '', messages: [] })
+  const [ai, setAi] = useState<AiStatus | null>(null)
+  const historyFor = useRef<string | null>(null)
+  const messages = chatLog.snapshot === snapshotId ? chatLog.messages : []
 
   const selected = params.get('file')
   const line = params.get('line') ? Number(params.get('line')) : null
@@ -69,14 +74,35 @@ export function Workspace() {
   const openCode = useCallback((path: string, at?: number) => go('files', { file: path, line: at ?? null }), [go])
   const openIssue = useCallback((id: string | null) => go('issues', { issue: id }), [go])
 
-  const runAsk = useCallback((question: string) => {
-    const mine = ++askNumber.current  // a newer question replaces an older one still running
-    setAsked({ question, phase: 'asking' })
-    setCited(null)
-    api.ask(snapshotId, question)
-      .then((result) => { if (askNumber.current === mine) setAsked({ question, phase: 'done', result }) })
-      .catch((e: Error) => { if (askNumber.current === mine) setAsked({ question, phase: 'error', error: e.message }) })
+  const updateMessages = useCallback((change: (list: ChatMessage[]) => ChatMessage[]) => {
+    setChatLog((prev) => ({ snapshot: snapshotId, messages: change(prev.snapshot === snapshotId ? prev.messages : []) }))
   }, [snapshotId])
+
+  const openChat = useCallback(() => {
+    setChat('open')
+    if (historyFor.current === snapshotId) return
+    historyFor.current = snapshotId
+    api.ai().then(setAi).catch(() => setAi({ available: false, reason: "Couldn't check the AI settings." }))
+    api.asks(snapshotId).then((history) => {
+      const earlier = [...history].reverse().map((result) => ({ id: result.id, question: result.question, result }))
+      updateMessages((list) => [...earlier.filter((m) => !list.some((x) => x.result?.id === m.id)), ...list])
+    }).catch(() => { /* no history: the chat starts empty */ })
+  }, [snapshotId, updateMessages])
+
+  const sendQuestion = useCallback((question: string) => {
+    openChat()
+    const id = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    updateMessages((list) => [...list, { id, question }])
+    api.ask(snapshotId, question)
+      .then((result) => updateMessages((list) => list.map((m) => (m.id === id ? { ...m, result } : m))))
+      .catch((e: Error) => updateMessages((list) => list.map((m) => (m.id === id ? { ...m, error: e.message } : m))))
+  }, [snapshotId, openChat, updateMessages])
+
+  const showInMap = useCallback((paths: string[]) => {
+    setCited(paths)
+    setChat('minimised')  // out of the way, so the lit files are visible
+    go('map')
+  }, [go])
 
   if (error) {
     return (
@@ -99,14 +125,9 @@ export function Workspace() {
   const issueCount = report.insights.length
   const hot = (report.summary.totals.by_severity.high ?? 0) > 0
 
-  const askPanel = asked && (
-    <AskPanel state={asked} floating={tab !== 'map'}
-      onClose={() => { askNumber.current++; setAsked(null); setCited(null) }}
-      onOpenCode={openCode}
-      onShowInMap={(paths) => { setCited(paths); go('map') }} />
-  )
+  const busy = messages.some((m) => !m.result && !m.error)
 
-  const inspector = !asked && selectedFile && tab !== 'files' && (
+  const inspector = selectedFile && tab !== 'files' && (
     <Inspector
       report={report}
       file={selectedFile}
@@ -137,8 +158,7 @@ export function Workspace() {
           )}
         </div>
         <div className="spacer" />
-        <AskBox busy={asked?.phase === 'asking'} onAsk={runAsk} />
-        <SearchBox snapshotId={snapshotId} onPick={(path, at) => openCode(path, at)} />
+        <CommandBox snapshotId={snapshotId} onPick={(path, at) => openCode(path, at)} onAsk={sendQuestion} />
         <ThemeToggle />
       </header>
 
@@ -174,8 +194,15 @@ export function Workspace() {
             onOpenIssue={(id) => openIssue(id)} />
         )}
         {inspector}
-        {askPanel}
       </main>
+
+      {chat === 'open' ? (
+        <ChatPanel repoName={repo.name} ai={ai} messages={messages} examples={exampleQuestions(report)}
+          onSend={sendQuestion} onMinimise={() => setChat('minimised')} onClose={() => setChat('closed')}
+          onOpenCode={(path, at) => { setChat('minimised'); openCode(path, at) }} onShowInMap={showInMap} />
+      ) : (
+        <ChatButton busy={busy} shifted={!!inspector} onClick={openChat} />
+      )}
     </div>
   )
 }

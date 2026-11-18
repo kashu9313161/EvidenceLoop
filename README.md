@@ -15,10 +15,12 @@ repository is ever run.
 - **Files:** the code with each file's role, description, functions and complexity.
 - **What is this file?** With a Google Gemini or Anthropic API key, each file also gets a short AI-written paragraph on what it does
   and what it contributes, plus the functions to read first (each checked against the real code).
-- **Ask:** type a question in the top bar. Lookups ("where is load_data", "what calls main", "which files use
-  pandas") are answered from the index with no AI. Open questions ("how is the model trained?") are answered with
-  claims that each cite code; every citation is checked and each claim is marked verified, not enough evidence,
-  or rejected. "Show in map" lights up the cited files.
+- **Search and ask:** one box at the top right (Ctrl K) finds files, functions and text as you type, and answers
+  lookups ("where is load_data", "what calls main", "which files use pandas") in place from the index, with no AI.
+  Anything else goes to the **AI chat** (the button at the bottom right): open questions ("how is the model
+  trained?") are answered with claims that each cite code; every citation is checked and each claim is marked
+  verified, not enough evidence, or rejected. "Show in map" lights up the cited files. Past questions are kept
+  per repository.
 
 ## Quick start
 

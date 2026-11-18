@@ -195,6 +195,10 @@ export function MapView({ report, selected, onSelect, impactOn, highlight, onCle
     if (node?.x != null && node.y != null) graphRef.current?.centerAt(node.x, node.y, 500)
   }, [selected]) // eslint-disable-line react-hooks/exhaustive-deps
 
+
+  const reduceMotion = typeof window !== 'undefined' &&
+    window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+
   // Fit the view to the files an answer cites, or to everything.
   const frame = () => {
     const onMap = cited && data.nodes.some((n) => cited.has(n.id))
@@ -204,9 +208,6 @@ export function MapView({ report, selected, onSelect, impactOn, highlight, onCle
   useEffect(() => {
     if (cited) frame()
   }, [cited]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  const reduceMotion = typeof window !== 'undefined' &&
-    window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
 
   // ---- drawing -----------------------------------------------------------------------------
   const radius = (n: MapNode) => (n.isArea ? 12 + Math.sqrt(n.weight) * 5 : 5 + Math.sqrt(n.fanIn) * 3.6)
