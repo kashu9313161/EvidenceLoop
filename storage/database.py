@@ -184,6 +184,80 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
     FOREIGN KEY (snapshot_id)
         REFERENCES snapshots(snapshot_id)
 );
+
+-- AI-written file explanations, cached until the file, the prompt or the model changes.
+CREATE TABLE IF NOT EXISTS file_explanations (
+    snapshot_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    model TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    explanation TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, path, content_sha256, prompt_version, model)
+);
+
+-- M3: Ask. One row per question; its claims; the evidence each claim cites.
+CREATE TABLE IF NOT EXISTS asks (
+    ask_id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL,
+    question TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    provider TEXT,
+    model TEXT,
+    usage TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_asks_snapshot ON asks(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS ask_claims (
+    ask_id TEXT NOT NULL,
+    claim_index INTEGER NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    support REAL,
+    contradiction REAL,
+    sufficiency REAL,
+    evaluator TEXT,
+    model_version TEXT,
+    checks TEXT NOT NULL,
+    PRIMARY KEY (ask_id, claim_index)
+);
+
+CREATE TABLE IF NOT EXISTS ask_claim_evidence (
+    ask_id TEXT NOT NULL,
+    claim_index INTEGER NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    path TEXT,
+    start_line INTEGER,
+    end_line INTEGER,
+    sha256 TEXT
+);
+
+-- Every call to a language-model provider: what was sent, by whom, and what it cost.
+CREATE TABLE IF NOT EXISTS provider_sends (
+    send_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id TEXT NOT NULL,
+    ask_id TEXT,
+    purpose TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    prompt_sha256 TEXT NOT NULL,
+    prompt_chars INTEGER NOT NULL,
+    prompt TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL,
+    error TEXT
+);
 """
 
 
@@ -239,7 +313,9 @@ def snapshot_root(snapshot) -> Path | None:
 
 
 SNAPSHOT_TABLES = ("files", "files_fts", "file_stages", "symbols", "symbols_fts", "imports",
-                   "calls", "graph_nodes", "graph_edges", "analysis_runs", "analysis_reports")
+                   "calls", "graph_nodes", "graph_edges", "analysis_runs", "analysis_reports",
+                   "file_explanations", "asks", "ask_claims", "ask_claim_evidence",
+                   "provider_sends")
 
 
 def delete_snapshot(snapshot_id: str, repositories_dir: Path | None = None) -> bool:

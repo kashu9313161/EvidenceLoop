@@ -1,6 +1,8 @@
 import type { Flow, Report } from '../api'
 import { areaLabel, areaPalette, fileName, plural, useTheme } from '../util'
 import { Rich, Sev } from './bits'
+import { ExplanationGlance } from './FileExplanation'
+import { MiniMap } from './MiniMap'
 
 interface Props {
   report: Report
@@ -79,14 +81,19 @@ export function Overview({ report, onSelect, onOpenIssue, onTab }: Props) {
 
   return (
     <div className="page">
-      <h1 className="lede">{summary.headline}</h1>
-      {summary.readme && (
-        <blockquote className="readme-quote">
-          {summary.readme}
-          <cite>From {summary.readme_path}</cite>
-        </blockquote>
-      )}
-      <p className="facts">{summary.facts.join(' ')}</p>
+      <div className="overview-top">
+        <div>
+          <h1 className="lede">{summary.headline}</h1>
+          {summary.readme && (
+            <blockquote className="readme-quote">
+              {summary.readme}
+              <cite>From {summary.readme_path}</cite>
+            </blockquote>
+          )}
+          <p className="facts">{summary.facts.join(' ')}</p>
+        </div>
+        <MiniMap report={report} onOpen={() => onTab('map')} />
+      </div>
 
       <div className="statline" role="list" aria-label="Key numbers">
         <div className="stat" role="listitem"><b>{totals.source_files}</b><span>source files</span></div>
@@ -207,7 +214,12 @@ export function Overview({ report, onSelect, onOpenIssue, onTab }: Props) {
                   {fileName(key.path)}
                 </button>
                 <span className="num">{plural(key.impact, 'dependent')}</span>
-                <span className="why">{key.why}</span>
+                {(() => {
+                  const info = report.files.find((f) => f.path === key.path)
+                  return info
+                    ? <ExplanationGlance snapshotId={report.snapshot.id} file={info} fallback={key.why} />
+                    : <span className="why">{key.why}</span>
+                })()}
               </div>
             ))}
             {summary.key_files.every((k) => k.impact === 0) && (

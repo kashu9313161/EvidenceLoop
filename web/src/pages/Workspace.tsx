@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { api, type Report, workspacePath } from '../api'
+import { AskBox, AskPanel, type AskState } from '../components/Ask'
 import { Logo, ThemeToggle } from '../components/bits'
 import { Files } from '../components/Files'
 import { Inspector } from '../components/Inspector'
@@ -24,6 +25,9 @@ export function Workspace() {
   const [report, setReport] = useState<Report | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [impactOn, setImpactOn] = useState(false)
+  const [asked, setAsked] = useState<AskState | null>(null)
+  const [cited, setCited] = useState<string[] | null>(null)
+  const askNumber = useRef(0)
 
   const selected = params.get('file')
   const line = params.get('line') ? Number(params.get('line')) : null
@@ -65,6 +69,15 @@ export function Workspace() {
   const openCode = useCallback((path: string, at?: number) => go('files', { file: path, line: at ?? null }), [go])
   const openIssue = useCallback((id: string | null) => go('issues', { issue: id }), [go])
 
+  const runAsk = useCallback((question: string) => {
+    const mine = ++askNumber.current  // a newer question replaces an older one still running
+    setAsked({ question, phase: 'asking' })
+    setCited(null)
+    api.ask(snapshotId, question)
+      .then((result) => { if (askNumber.current === mine) setAsked({ question, phase: 'done', result }) })
+      .catch((e: Error) => { if (askNumber.current === mine) setAsked({ question, phase: 'error', error: e.message }) })
+  }, [snapshotId])
+
   if (error) {
     return (
       <div className="centered">
@@ -86,7 +99,14 @@ export function Workspace() {
   const issueCount = report.insights.length
   const hot = (report.summary.totals.by_severity.high ?? 0) > 0
 
-  const inspector = selectedFile && tab !== 'files' && (
+  const askPanel = asked && (
+    <AskPanel state={asked} floating={tab !== 'map'}
+      onClose={() => { askNumber.current++; setAsked(null); setCited(null) }}
+      onOpenCode={openCode}
+      onShowInMap={(paths) => { setCited(paths); go('map') }} />
+  )
+
+  const inspector = !asked && selectedFile && tab !== 'files' && (
     <Inspector
       report={report}
       file={selectedFile}
@@ -117,6 +137,7 @@ export function Workspace() {
           )}
         </div>
         <div className="spacer" />
+        <AskBox busy={asked?.phase === 'asking'} onAsk={runAsk} />
         <SearchBox snapshotId={snapshotId} onPick={(path, at) => openCode(path, at)} />
         <ThemeToggle />
       </header>
@@ -139,7 +160,8 @@ export function Workspace() {
           </div>
         )}
         {tab === 'map' && (
-          <MapView report={report} selected={selected} onSelect={select} impactOn={impactOn} />
+          <MapView report={report} selected={selected} onSelect={select} impactOn={impactOn}
+            highlight={cited} onClearHighlight={() => setCited(null)} />
         )}
         {tab === 'issues' && (
           <div className="scroll">
@@ -152,6 +174,7 @@ export function Workspace() {
             onOpenIssue={(id) => openIssue(id)} />
         )}
         {inspector}
+        {askPanel}
       </main>
     </div>
   )

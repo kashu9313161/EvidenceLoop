@@ -4,6 +4,7 @@ import { plainFileNote } from '../fileNote'
 import { fileName, plural } from '../util'
 import { Rich, Sev } from './bits'
 import { CodeBlock } from './CodeBlock'
+import { FileExplanation } from './FileExplanation'
 
 interface Props {
   report: Report
@@ -154,7 +155,8 @@ export function Files({ report, path, line, onOpen, onOpenIssue }: Props) {
               <span className="faint" style={{ fontSize: 13.5, marginLeft: 6 }}>
                 {plural(info.loc, 'line')} of code, used by {plural(info.fan_in, 'file')}, uses {plural(info.fan_out, 'file')}
               </span>
-              <p><Rich text={info.description} /></p>
+              <FileExplanation snapshotId={report.snapshot.id} file={info} collapsible
+                onOpenLine={(at) => onOpen(info.path, at)} />
             </header>
             <div className="file-panels">
               <div className="file-code" data-scroller>

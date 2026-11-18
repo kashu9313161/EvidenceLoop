@@ -23,6 +23,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from analysis.pipeline import AnalysisError
+from analysis.understanding import explain
+from analysis.understanding.explain import ExplainError
 from analysis.understanding.report import ReportError, load_report, run_full_analysis
 from core.textio import decode_text
 from ingestion.service import (
@@ -31,6 +33,9 @@ from ingestion.service import (
     ingest_zip_bytes,
     parse_github_url,
 )
+from intelligence.ask import AskError
+from intelligence.ask import ask as run_ask
+from intelligence.providers import Provider, ProviderError, ai_status, provider_for
 from storage.database import (
     get_connection,
     get_snapshot,
@@ -151,11 +156,21 @@ def _run(job: Job, ingest) -> None:
 
         run_full_analysis(result["snapshot_id"], progress)
         _update(job, stage="done", message="Analysis complete", finished=time.time())
+        _pregenerate_explanations(result["snapshot_id"])
     except (IngestionError, AnalysisError, ReportError) as exc:
         _update(job, stage="error", error=str(exc), finished=time.time())
     except Exception as exc:  # pragma: no cover - surfaced to the UI instead of a dead job
         _update(job, stage="error", error=f"Unexpected error: {type(exc).__name__}: {exc}",
                 finished=time.time())
+
+
+def _pregenerate_explanations(snapshot_id: str) -> None:
+    """With an API key, explain the most important files in the background so the first
+    clicks are instant. Without one, do nothing."""
+    provider = explain.current_provider()
+    if provider is not None:
+        threading.Thread(target=explain.pregenerate, args=(snapshot_id, provider),
+                         daemon=True).start()
 
 
 def _start(source: str, ingest) -> Job:
@@ -312,6 +327,78 @@ def search(snapshot: str = Query(...), q: str = Query(..., min_length=1)) -> dic
         for r in search_symbols(snapshot, needle, limit=15)
     ] if terms else []
     return {"files": paths, "symbols": symbols, "content": content}
+
+
+# --------------------------------------------------------------------------- ask
+
+
+def ask_providers() -> tuple[Provider | None, Provider | None]:
+    """The models that answer and judge (EL_MODEL_ASK, EL_MODEL_JUDGE). Tests replace this."""
+    return provider_for("ask"), provider_for("judge")
+
+
+class AskRequest(BaseModel):
+    snapshot: str
+    question: str
+
+
+@app.post("/api/ask")
+def ask_question(request: AskRequest) -> dict:
+    """Answer a question with claims that cite checked evidence. Lookups use no AI; open
+    questions use the configured provider, within the per-question token and cost limits.
+    A POST, so other sites can't spend the key."""
+    _require_snapshot(request.snapshot)
+    answer, judge = ask_providers()
+    try:
+        return run_ask(request.snapshot, request.question, answer_provider=answer,
+                       judge_provider=judge)
+    except AskError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- explanations
+
+
+def _no_ai() -> dict:
+    return {"available": False, "reason": ai_status()[1]}
+
+
+@app.get("/api/explain")
+def explanation(snapshot: str = Query(...), path: str = Query(...)) -> dict:
+    """The cached AI explanation of a file, if there is one. Never calls the model: writing
+    one costs money, so it takes a POST, which other sites can't send."""
+    _require_snapshot(snapshot)
+    provider = explain.current_provider()
+    if provider is None:
+        return _no_ai()
+    try:
+        found = explain.cached_explanation(snapshot, path, provider.model)
+    except ExplainError as exc:
+        return {"available": True, "status": "unavailable", "reason": str(exc)}
+    return {"available": True, "status": "ready" if found else "missing", "explanation": found}
+
+
+class ExplainRequest(BaseModel):
+    snapshot: str
+    path: str
+    refresh: bool = False
+
+
+@app.post("/api/explain")
+def write_explanation(request: ExplainRequest) -> dict:
+    """Explain a file now (or return the cached explanation), or rewrite it with refresh."""
+    _require_snapshot(request.snapshot)
+    provider = explain.current_provider()
+    if provider is None:
+        return _no_ai()
+    try:
+        found = explain.explain_file(request.snapshot, request.path, provider,
+                                     refresh=request.refresh)
+    except ExplainError as exc:
+        return {"available": True, "status": "unavailable", "reason": str(exc)}
+    except ProviderError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return {"available": True, "status": "ready", "explanation": found}
 
 
 # --------------------------------------------------------------------------- web app

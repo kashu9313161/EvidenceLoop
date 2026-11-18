@@ -2,6 +2,9 @@ import { forceX, forceY } from 'd3-force'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ForceGraph2D, { type ForceGraphMethods, type LinkObject, type NodeObject } from 'react-force-graph-2d'
 import type { Report } from '../api'
+import {
+  areaGraph, defaultSettings, fileGraph, layoutFor, seedPosition, startsWithAreas,
+} from '../mapLayout'
 import { areaLabel, areaPalette, cssVar, fileName, plural, useTheme } from '../util'
 
 interface Props {
@@ -9,6 +12,9 @@ interface Props {
   selected: string | null
   onSelect: (path: string | null) => void
   impactOn: boolean
+  /** Files to light up (cited by an answer), and how to stop. */
+  highlight?: string[] | null
+  onClearHighlight?: () => void
 }
 
 type ColourBy = 'area' | 'issues'
@@ -28,6 +34,8 @@ interface MapNode {
   isArea?: boolean
   x?: number
   y?: number
+  fx?: number
+  fy?: number
 }
 
 interface MapLink {
@@ -38,31 +46,19 @@ interface MapLink {
   weight: number
 }
 
-const MAX_FILE_NODES = 400
-const MAX_EDGES = 1500
-
-function hash(text: string): number {
-  let h = 2166136261
-  for (let i = 0; i < text.length; i++) {
-    h ^= text.charCodeAt(i)
-    h = Math.imul(h, 16777619)
-  }
-  return (h >>> 0) / 4294967295
-}
-
 const idOf = (end: string | MapNode) => (typeof end === 'string' ? end : end.id)
 
-export function MapView({ report, selected, onSelect, impactOn }: Props) {
+export function MapView({ report, selected, onSelect, impactOn, highlight, onClearHighlight }: Props) {
   const [theme] = useTheme()
   const wrap = useRef<HTMLDivElement | null>(null)
   const graphRef = useRef<ForceGraphMethods<NodeObject<MapNode>, LinkObject<MapNode, MapLink>> | undefined>(undefined)
   const [size, setSize] = useState({ width: 800, height: 600 })
-  const tooBig = report.graph.nodes.length > MAX_FILE_NODES || report.graph.edges.length > MAX_EDGES
-  const [view, setView] = useState<View>(tooBig ? 'areas' : 'files')
+  const defaults = defaultSettings(report)
+  const [view, setView] = useState<View>(startsWithAreas(report) ? 'areas' : 'files')
   const [colourBy, setColourBy] = useState<ColourBy>('area')
-  const [showTests, setShowTests] = useState(false)
-  const [showInferred, setShowInferred] = useState(true)
-  const [showOrphans, setShowOrphans] = useState(report.graph.nodes.length <= MAX_FILE_NODES / 2)
+  const [showTests, setShowTests] = useState(defaults.showTests)
+  const [showInferred, setShowInferred] = useState(defaults.showInferred)
+  const [showOrphans, setShowOrphans] = useState(defaults.showOrphans)
   const [hover, setHover] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const [areaFocus, setAreaFocus] = useState<string | null>(null)
@@ -86,53 +82,41 @@ export function MapView({ report, selected, onSelect, impactOn }: Props) {
 
   // ---- data ----------------------------------------------------------------------------
   const data = useMemo(() => {
-    const areas = report.architecture.areas
-    const areaIndex = new Map(areas.map((a, i) => [a.name, i]))
-    const angleOf = (area: string) => ((areaIndex.get(area) ?? 0) / Math.max(areas.length, 1)) * Math.PI * 2
+    const areaNames = report.architecture.areas.map((a) => a.name)
+    // Nodes in the opening layout (the one the Overview preview shows) are pinned where it put
+    // them, so the map opens in the same shape and doesn't drift. Nodes that settings add
+    // (tests, unconnected files) start near their area and settle around them; a dragged node
+    // stays where it is dropped.
+    const layout = layoutFor(report, view)
+    const place = (id: string, area: string, isArea: boolean) => {
+      const known = layout.get(id)
+      return known ? { x: known.x, y: known.y, fx: known.x, fy: known.y } : seedPosition(id, area, areaNames, isArea)
+    }
 
     if (view === 'areas') {
-      const nodes: MapNode[] = areas
-        .filter((a) => showTests || a.name !== 'tests')
-        .map((a) => ({
-          id: a.name, label: areaLabel(a.name), area: a.name, weight: a.files.length,
-          fanIn: report.graph.area_edges.filter((e) => e.target === a.name).reduce((s, e) => s + e.edges, 0),
-          failed: false, cycle: false, test: a.name === 'tests', entry: false,
-          severity: a.insights ? 'medium' : null, isArea: true,
-          x: Math.cos(angleOf(a.name)) * 120, y: Math.sin(angleOf(a.name)) * 120,
-        }))
-      const ids = new Set(nodes.map((n) => n.id))
-      const links: MapLink[] = report.graph.area_edges
-        .filter((e) => ids.has(e.source) && ids.has(e.target))
+      const { nodes: areas, edges } = areaGraph(report, showTests)
+      const nodes: MapNode[] = areas.map((a) => ({
+        id: a.name, label: areaLabel(a.name), area: a.name, weight: a.files.length,
+        fanIn: report.graph.area_edges.filter((e) => e.target === a.name).reduce((s, e) => s + e.edges, 0),
+        failed: false, cycle: false, test: a.name === 'tests', entry: false,
+        severity: a.insights ? 'medium' : null, isArea: true, ...place(a.name, a.name, true),
+      }))
+      const links: MapLink[] = edges
         .map((e) => ({ source: e.source, target: e.target, tier: 'confirmed', kind: 'imports', weight: e.edges }))
       return { nodes, links }
     }
 
-    // Type-hint-only imports never run, so they aren't dependencies (and make no cycles).
-    const edges = report.graph.edges.filter(
-      (e) => !e.type_only && (showInferred || e.tier === 'confirmed') && (showTests || e.kind !== 'tests'),
-    )
-    const connected = new Set(edges.flatMap((e) => [e.source, e.target]))
-    const nodes: MapNode[] = report.graph.nodes
-      // Empty files (package markers like an empty __init__.py) carry no information on a map.
-      .filter((n) => n.loc > 0 || connected.has(n.id) || n.id === selected)
-      .filter((n) => (showTests || !n.is_test) && (showOrphans || connected.has(n.id) || n.id === selected))
-      .map((n) => {
-        const angle = angleOf(n.area)
-        const r = 140 + hash(n.id) * 90
-        return {
-          id: n.id, label: fileName(n.id), area: n.area, weight: n.loc, fanIn: n.fan_in,
-          failed: n.status === 'failed', cycle: n.in_cycle, test: n.is_test, entry: n.is_entry,
-          severity: n.severity,
-          x: Math.cos(angle) * r + (hash(`${n.id}x`) - 0.5) * 60,
-          y: Math.sin(angle) * r + (hash(`${n.id}y`) - 0.5) * 60,
-        }
-      })
-    const ids = new Set(nodes.map((n) => n.id))
-    const links: MapLink[] = edges
-      .filter((e) => ids.has(e.source) && ids.has(e.target))
+    const graph = fileGraph(report, { showTests, showInferred, showOrphans }, [selected, ...(highlight ?? [])])
+    const nodes: MapNode[] = graph.nodes.map((n) => ({
+      id: n.id, label: fileName(n.id), area: n.area, weight: n.loc, fanIn: n.fan_in,
+      failed: n.status === 'failed', cycle: n.in_cycle, test: n.is_test, entry: n.is_entry,
+      severity: n.severity, ...place(n.id, n.area, false),
+    }))
+    const links: MapLink[] = graph.edges
       .map((e) => ({ source: e.source, target: e.target, tier: e.tier, kind: e.kind, weight: e.lines.length }))
     return { nodes, links }
-  }, [report, view, showTests, showInferred, showOrphans, selected])
+  }, [report, view, showTests, showInferred, showOrphans, selected, highlight])
+  const settled = data.nodes.every((n) => n.fx != null)
 
   // adjacency for hover / impact
   const { neighbours, predecessors } = useMemo(() => {
@@ -173,17 +157,19 @@ export function MapView({ report, selected, onSelect, impactOn }: Props) {
     return new Set(data.nodes.filter((n) => n.id.toLowerCase().includes(q)).map((n) => n.id))
   }, [query, data])
 
+  const cited = useMemo(() => (highlight && view === 'files' ? new Set(highlight) : null), [highlight, view])
   const focusId = hover ?? (view === 'files' ? selected : null)
   const isLit = useCallback((id: string) => {
     if (impactSet) return impactSet.has(id)
     if (matches) return matches.has(id)
+    if (cited && !hover) return cited.has(id)
     if (areaFocus && view === 'files') {
       const node = data.nodes.find((n) => n.id === id)
       return node?.area === areaFocus
     }
     if (!focusId) return true
     return id === focusId || (neighbours.get(focusId)?.has(id) ?? false)
-  }, [impactSet, matches, focusId, neighbours, areaFocus, view, data])
+  }, [impactSet, matches, cited, hover, focusId, neighbours, areaFocus, view, data])
 
   // ---- forces & framing ------------------------------------------------------------------
   useEffect(() => {
@@ -208,6 +194,16 @@ export function MapView({ report, selected, onSelect, impactOn }: Props) {
     const node = data.nodes.find((n) => n.id === selected)
     if (node?.x != null && node.y != null) graphRef.current?.centerAt(node.x, node.y, 500)
   }, [selected]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Fit the view to the files an answer cites, or to everything.
+  const frame = () => {
+    const onMap = cited && data.nodes.some((n) => cited.has(n.id))
+    graphRef.current?.zoomToFit(reduceMotion ? 0 : 500, onMap ? 110 : 70,
+      onMap ? (n) => cited.has((n as MapNode).id) : undefined)
+  }
+  useEffect(() => {
+    if (cited) frame()
+  }, [cited]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const reduceMotion = typeof window !== 'undefined' &&
     window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
@@ -288,6 +284,7 @@ export function MapView({ report, selected, onSelect, impactOn }: Props) {
     const t = idOf(link.target)
     if (impactSet) return impactSet.has(s) && impactSet.has(t)
     if (matches) return matches.has(s) || matches.has(t)
+    if (cited && !hover) return cited.has(s) && cited.has(t)
     if (areaFocus && view === 'files') {
       const a = data.nodes.find((n) => n.id === s)?.area
       const b = data.nodes.find((n) => n.id === t)?.area
@@ -356,6 +353,16 @@ export function MapView({ report, selected, onSelect, impactOn }: Props) {
             )}
           </>
         )}
+        {highlight && (
+          <div className="map-cited">
+            {view === 'files'
+              ? `Lit: ${highlight.length === 1 ? 'the file' : `${highlight.length} files`} the answer cites` +
+                (highlight.some((p) => !data.nodes.find((n) => n.id === p))
+                  ? " (text files like READMEs aren't on the map)" : '') + '.'
+              : 'Switch to Files to see the cited files.'}{' '}
+            {onClearHighlight && <button className="link-btn" onClick={onClearHighlight}>Show everything</button>}
+          </div>
+        )}
         {areaFocus && view === 'files' && (
           <button className="btn btn-quiet" onClick={() => setAreaFocus(null)}>
             Showing {areaLabel(areaFocus)}. Show everything
@@ -415,12 +422,12 @@ export function MapView({ report, selected, onSelect, impactOn }: Props) {
             }
           }}
           onBackgroundClick={() => { onSelect(null); setAreaFocus(null) }}
-          cooldownTicks={reduceMotion ? 0 : 180}
-          warmupTicks={reduceMotion ? 200 : 30}
+          cooldownTicks={settled ? 1 : reduceMotion ? 0 : 180}
+          warmupTicks={settled ? 0 : reduceMotion ? 200 : 30}
           onEngineStop={() => {
             if (!framed.current) {
               framed.current = true
-              graphRef.current?.zoomToFit(reduceMotion ? 0 : 500, 70)
+              frame()
             }
           }}
           enableNodeDrag

@@ -251,6 +251,89 @@ export interface FileDetail {
   symbols: { kind: string; name: string; start: number; end: number }[]
 }
 
+export interface KeyPart {
+  symbol: string
+  kind: string
+  start: number
+  end: number
+  does: string
+}
+
+export interface Explanation {
+  summary: string
+  key_parts: KeyPart[]
+  dropped: number
+  model: string
+  sent: string
+  created_at: string
+}
+
+export interface ExplainResponse {
+  available: boolean
+  reason?: string
+  status?: 'ready' | 'missing' | 'unavailable'
+  explanation?: Explanation | null
+}
+
+export type ClaimStatus = 'verified' | 'insufficient' | 'rejected'
+
+export interface AskEvidence {
+  id: string
+  path: string
+  start: number
+  end: number
+  kind: 'code' | 'import' | 'issue'
+  label: string
+  text: string
+  sha256: string
+}
+
+export interface AskJudgment {
+  support: number
+  contradiction: number
+  sufficiency: number
+  evaluator: string
+  model_version: string
+  reason: string
+}
+
+export interface AskClaim {
+  text: string
+  evidence_ids: string[]
+  status: ClaimStatus
+  reason: string
+  checks: { check: string; ok: boolean; detail: string }[]
+  judgment: AskJudgment | null
+}
+
+export interface AskUsage {
+  calls: number
+  input_tokens: number
+  output_tokens: number
+  cost_usd: number | null
+  max_tokens: number
+  max_cost_usd: number
+}
+
+export interface AskResult {
+  id: string
+  snapshot_id: string
+  question: string
+  kind: 'lookup' | 'analytical'
+  lookup: 'where' | 'callers' | 'users' | null
+  route: string
+  status: 'answered' | 'needs_ai' | 'budget' | 'failed'
+  summary: string
+  more: number
+  claims: AskClaim[]
+  evidence: AskEvidence[]
+  usage: AskUsage
+  provider: string | null
+  model: string | null
+  thresholds: { support: number; sufficiency: number; contradiction: number; calibrated: boolean }
+  created_at: string
+}
+
 export interface SearchResult {
   files: string[]
   symbols: { name: string; path: string; start: number; end: number }[]
@@ -299,6 +382,23 @@ export const api = {
     return request<Job>('/api/analyze/upload', { method: 'POST', body })
   },
   job: (id: string) => request<Job>(`/api/jobs/${q(id)}`),
+  /** Ask a question: lookups use no AI; open questions are answered with checked claims. */
+  ask: (snapshot: string, question: string) =>
+    request<AskResult>('/api/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshot, question }),
+    }),
+  /** The cached AI explanation of a file; never calls the model. */
+  explanation: (snapshot: string, path: string) =>
+    request<ExplainResponse>(`/api/explain?snapshot=${q(snapshot)}&path=${q(path)}`),
+  /** Write the explanation now (or rewrite it with refresh). */
+  explain: (snapshot: string, path: string, refresh = false) =>
+    request<ExplainResponse>('/api/explain', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshot, path, refresh }),
+    }),
 }
 
 export const workspacePath = (snapshotId: string, tab = 'overview') =>

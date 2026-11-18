@@ -10,6 +10,7 @@ dependencies = [
   "pydantic>=2.6",
   "networkx>=3.2",
   "python-multipart>=0.0.9",
+  "anthropic>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -23,7 +24,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["analysis*", "api*", "cli*", "core*", "ingestion*", "storage*"]
+include = ["analysis*", "api*", "cli*", "core*", "ingestion*", "intelligence*", "retrieval*",
+           "storage*", "verification*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

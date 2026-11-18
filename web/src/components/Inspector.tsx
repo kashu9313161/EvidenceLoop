@@ -1,6 +1,7 @@
 import type { FileInfo, Report } from '../api'
 import { fileName, plural } from '../util'
 import { CloseIcon, Rich, Sev } from './bits'
+import { FileExplanation } from './FileExplanation'
 
 interface Props {
   report: Report
@@ -58,7 +59,8 @@ export function Inspector({ report, file, onSelect, onOpenCode, onOpenIssue, onC
         {file.status === 'failed' && (
           <p className="muted">Could not be analyzed: {file.failure}</p>
         )}
-        <p><Rich text={file.description} /></p>
+        <FileExplanation snapshotId={report.snapshot.id} file={file}
+          onOpenLine={(line) => onOpenCode(file.path, line)} />
 
         <div className="inspector-actions">
           <button className="btn" onClick={() => onOpenCode(file.path)}>Read the code</button>

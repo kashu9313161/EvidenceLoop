@@ -85,6 +85,10 @@ The original EvidenceLoop idea, now on solid ground: the graph and index already
 Done when a lookup answers with no LLM call, an analytical question returns verified claims with correct
 citations, and a fabricated citation is rejected.
 
+**Status (Nov 18): steps 2–5 built ahead of Gate A**, with the LLM judge as the only evaluator. Tested offline with
+fake models; not yet run against a real model. Thresholds are uncalibrated until Gate A. Still to do: Gate A
+(Jev behind the same `Evaluator` protocol, the labelled set, calibration) and tuning evidence ranking against it.
+
 ### M4. Deeper facts (Dec 3 – Dec 12)
 
 - Function-level call graph (resolved through imports; dynamic calls marked unresolved) so the details panel shows
@@ -96,6 +100,9 @@ citations, and a fabricated citation is rejected.
 - Large repositories: folder aggregation with expand-in-place above ~400 files or ~1,500 links.
 
 ### M5. AI explanations on top of the facts (Dec 13 – Dec 19)
+
+Started early (Nov 18): "What is this file?" explanations with checked key parts, cached by content, plus the provider
+layer Ask will reuse. Still to do here:
 
 - LLM-written summaries for areas, key files and flows, generated from the deterministic facts, cached per commit,
   and shown with the facts they rest on. Clearly labelled as generated.
