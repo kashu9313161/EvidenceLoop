@@ -99,6 +99,9 @@ class Manifest:
     path: str
     kind: str  # requirements | pyproject | package.json | setup.py
     requirements: list[Requirement] = field(default_factory=list)
+    # Declares a reusable library: a "Libraries" classifier in pyproject.toml, or a
+    # package.json with `exports`/`types` (or a `main` on a package that isn't private).
+    library: bool = False
 
     @property
     def directory(self) -> str:
@@ -151,6 +154,9 @@ def parse_manifest(path: str, text: str) -> Manifest | None:
         except tomllib.TOMLDecodeError:
             return None
         manifest = Manifest(path, "pyproject")
+        classifiers = data.get("project", {}).get("classifiers", [])
+        manifest.library = any(isinstance(c, str) and "Software Development :: Libraries" in c
+                               for c in classifiers)
         entries: list[str] = list(data.get("project", {}).get("dependencies", []))
         for group in data.get("project", {}).get("optional-dependencies", {}).values():
             entries.extend(group)
@@ -176,6 +182,13 @@ def parse_manifest(path: str, text: str) -> Manifest | None:
         except json.JSONDecodeError:
             return None
         manifest = Manifest(path, "package.json")
+        if isinstance(data, dict):
+            manifest.library = bool(
+                data.get("exports") or data.get("types") or data.get("typings")
+                or (data.get("main") and data.get("private") is not True)
+            )
+        else:
+            return None
         for section in ("dependencies", "devDependencies", "peerDependencies"):
             for dep, spec in (data.get(section) or {}).items():
                 if isinstance(spec, str):

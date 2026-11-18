@@ -63,6 +63,17 @@ def test_ambiguous_or_stdlib_shadowing_imports_are_inferred():
     assert (shadow.target, shadow.tier) == ("a/logging.py", "inferred")
 
 
+def test_stdlib_names_inside_a_package_are_the_standard_library():
+    # click/_compat.py's `from types import TracebackType` is not click/types.py: Python 3
+    # doesn't search a package module's own folder for absolute imports.
+    resolver = PythonResolver({"src/click/__init__.py", "src/click/_compat.py",
+                               "src/click/types.py"})
+    stdlib = resolver.resolve("src/click/_compat.py", "types", "TracebackType", 0)
+    assert (stdlib.kind, stdlib.package) == ("stdlib", "types")
+    own = resolver.resolve("src/click/_compat.py", "click.types", "Path", 0)
+    assert own.target == "src/click/types.py"
+
+
 def test_external_stdlib_and_unresolved_classification():
     resolver = PythonResolver({"pkg/a.py"})
     assert resolver.resolve("pkg/a.py", "os.path", None, 0).kind == "stdlib"
@@ -320,3 +331,186 @@ def test_graph_json_matches_networkx(analyzed):
         if node_id in graph and not node["is_test"]:
             expected = sum(1 for p in graph.predecessors(node_id) if not is_test_path(p))
             assert node["fan_in"] == expected
+
+
+# ---------------------------------------------------------------------------- review fixes
+
+
+TYPED = {
+    "pyproject.toml": b"[project]\nname = 'pkg'\n",
+    "pkg/__init__.py": b"from pkg.core import run\nfrom pkg.state import current\n",
+    "pkg/core.py": b"from pkg.state import current\n\ndef run():\n    return current()\n",
+    "pkg/state.py": src('''
+        import typing as t
+
+        if t.TYPE_CHECKING:
+            from pkg.core import run
+
+        def current():
+            return 1
+    ''').encode(),
+    "pkg/a.py": b"from pkg.state import current\n",
+    "pkg/b.py": b"from pkg.state import current\n",
+    "tests/test_pkg.py": b"import pkg\n\ndef test_run():\n    assert pkg.run() == 1\n",
+}
+
+
+def test_type_hint_imports_make_no_cycle_and_package_tests_count(isolated_storage):
+    snapshot_id = ingest_zip_bytes(make_zip(TYPED), "pkg")["snapshot_id"]
+    report = run_full_analysis(snapshot_id)
+    rules = {i["rule"] for i in report["insights"]}
+    assert "import_cycle" not in rules  # state -> core is for type hints only
+    assert "untested_hub" not in rules  # `import pkg` in a test reaches pkg/state.py
+    edge = next(e for e in report["graph"]["edges"]
+                if (e["source"], e["target"]) == ("pkg/state.py", "pkg/core.py"))
+    assert edge["type_only"] is True
+    assert "through the package" in " ".join(report["summary"]["facts"])
+
+
+def test_tsconfig_paths_package_names_and_node_builtins(isolated_storage):
+    files = {
+        "package.json": b'{"name": "lib", "exports": {".": "./index.js"}, '
+                        b'"devDependencies": {"vite": "1"}}',
+        "tsconfig.json": b'{\n  // aliases\n  "compilerOptions": {"paths": '
+                         b'{"lib/*": ["./src/*.ts"],}}\n}',
+        "src/index.ts": b"export * from './vanilla'\n",
+        "src/vanilla.ts": b"export const create = () => 1\n",
+        "vite.config.ts": b"import path from 'path'\nexport default {}\n",
+        "tests/vanilla.test.ts": b"import { create } from 'lib/vanilla'\n",
+        "tests/index.test.ts": b"import { create } from 'lib'\n",
+    }
+    report = run_full_analysis(ingest_zip_bytes(make_zip(files), "lib")["snapshot_id"])
+    files_json = {f["path"]: f for f in report["files"]}
+    assert files_json["src/vanilla.ts"]["tested_by"] == ["tests/vanilla.test.ts"]
+    assert files_json["src/index.ts"]["tested_by"] == ["tests/index.test.ts"]
+    assert not [i for i in report["insights"] if i["rule"] == "undeclared_dependency"]
+    assert report["summary"]["kind"] == "library"
+
+
+def test_nested_tsconfig_base_url_own_package_and_builtins():
+    from analysis.graph.resolver import js_aliases, package_names
+
+    aliases = js_aliases("web/tsconfig.json", '{"compilerOptions": {"baseUrl": "src", '
+                                              '"paths": {"@app/*": ["app/*"]}}}')
+    files = {"web/src/app/store.ts", "web/src/main.ts", "packages/ui/src/index.ts",
+             "packages/ui/src/button.ts"}
+    packages = package_names({"packages/ui/package.json": '{"name": "@acme/ui"}'})
+    assert packages == {"@acme/ui": "packages/ui"}
+    resolver = JsResolver(files, aliases, packages)
+
+    assert resolver.resolve("web/src/main.ts", "@app/store").target == "web/src/app/store.ts"
+    own = resolver.resolve("web/src/main.ts", "@acme/ui")
+    assert (own.target, own.tier) == ("packages/ui/src/index.ts", "inferred")
+    assert resolver.resolve("web/src/main.ts", "@acme/ui/button").target == (
+        "packages/ui/src/button.ts")
+    assert resolver.resolve("web/src/main.ts", "fs").kind == "stdlib"
+    assert resolver.resolve("web/src/main.ts", "react").kind == "external"
+    assert js_aliases("tsconfig.json", "not json") == []
+
+
+EXAMPLES = {
+    "pyproject.toml": b"[project]\nname = 'kit'\n",
+    "kit/__init__.py": b"from kit.core import run\n",
+    "kit/core.py": b"def run():\n    return 1\n",
+    "kit/util.py": b"from kit.core import run\n",
+    "kit/more.py": b"from kit.core import run\n",
+    "tests/test_kit.py": b"import kit\n\ndef test_run():\n    assert kit.run() == 1\n",
+    "docs_src/first/tutorial001.py": b"from fastapi import FastAPI\nfrom kit import run\n"
+                                     b"app = FastAPI()\n\n@app.get('/')\ndef root():\n"
+                                     b"    return run()\n",
+    "docs_src/second/tutorial002.py": b"from kit import run\n\nif __name__ == '__main__':\n"
+                                      b"    run()\n",
+    "examples/demo/main.py": b"from kit import run\n\nif __name__ == '__main__':\n    run()\n",
+}
+
+
+def test_examples_and_docs_code_do_not_define_the_project(isolated_storage):
+    report = run_full_analysis(ingest_zip_bytes(make_zip(EXAMPLES), "kit")["snapshot_id"])
+    summary = report["summary"]
+    assert summary["kind"] == "library"  # not a web service because of a docs tutorial
+    assert summary["headline"].startswith("kit is a Python library: 4 source files")
+    assert "plus 3 example or docs files" in summary["headline"]
+    facts = " ".join(summary["facts"])
+    assert "tutorial" not in facts and "main.py" not in facts
+    assert summary["totals"]["source_files"] == 4
+    assert summary["totals"]["supporting_files"] == 3
+    areas = report["architecture"]["areas"]
+    names = [a["name"] for a in areas]
+    # One area per example folder, after the project's own areas and before tests.
+    assert names == ["kit", "docs_src", "examples", "tests"]
+    assert [a["supporting"] for a in areas] == [False, True, True, False]
+    assert all(f["path"].startswith("kit/") for f in summary["key_files"])
+    assert not [i for i in report["insights"] if i["rule"] == "orphan_module"]
+
+
+def test_a_repository_of_only_examples_is_still_described():
+    from analysis.graph.builder import support_area
+
+    assert support_area("docs_src/security/tutorial001.py") == "docs_src"
+    assert support_area("packages/a/examples/x/y.ts") == "packages/a/examples"
+    assert support_area("src/kit/core.py") is None
+
+
+def test_imports_inside_functions_make_no_cycle_but_still_count(isolated_storage):
+    files = {
+        "pyproject.toml": b"[project]\nname = 'app'\n",  # a second root entry: no unwrapping
+        "app/__init__.py": b"",
+        "app/core.py": b"from app.helpers import fmt\n\ndef run():\n    return fmt(1)\n",
+        "app/helpers.py": src('''
+            def fmt(value):
+                from app.core import run  # deferred: runs on call, after both modules load
+                return str(value)
+        ''').encode(),
+        "app/loop_a.py": b"from app.loop_b import b\na = 1\n",
+        "app/loop_b.py": b"from app.loop_a import a\nb = 2\n",
+    }
+    report = run_full_analysis(ingest_zip_bytes(make_zip(files), "app")["snapshot_id"])
+    cycles = [i["files"] for i in report["insights"] if i["rule"] == "import_cycle"]
+    assert cycles == [["app/loop_a.py", "app/loop_b.py"]]  # a real load-time loop is kept
+    files_json = {f["path"]: f for f in report["files"]}
+    assert "app/helpers.py" in files_json["app/core.py"]["used_by"]  # still a dependency
+
+
+def test_a_library_is_described_by_its_public_api_not_its_scripts(isolated_storage):
+    files = {
+        "pyproject.toml": b"[project]\nname = 'kit'\nclassifiers = "
+                          b"['Topic :: Software Development :: Libraries']\n",
+        "kit/__init__.py": b"from kit.core import run\nfrom kit.util import fmt\n",
+        "kit/core.py": b"def run():\n    return 1\n",
+        "kit/util.py": b"def fmt():\n    return ''\n",
+        "scripts/release.py": b"import kit\n\nif __name__ == '__main__':\n    kit.run()\n",
+    }
+    report = run_full_analysis(ingest_zip_bytes(make_zip(files), "kit")["snapshot_id"])
+    facts = " ".join(report["summary"]["facts"])
+    assert "Its public API is kit/__init__.py" in facts
+    assert "release.py" not in facts
+    assert [f["entry"] for f in report["architecture"]["flows"]] == ["kit/__init__.py"]
+
+
+def test_a_repository_without_code_says_so(isolated_storage):
+    files = {"img/logo.png": b"\x89PNG\r\n\x1a\n" + b"\0" * 20, "notes.txt": b"hello\n"}
+    report = run_full_analysis(ingest_zip_bytes(make_zip(files), "assets")["snapshot_id"])
+    headline = report["summary"]["headline"]
+    assert headline == ("assets has no code EvidenceLoop can read: 2 files, none in Python, "
+                        "JavaScript or TypeScript.")
+
+
+def test_deleting_a_snapshot_removes_its_rows_and_files(isolated_storage):
+    from ingestion import service
+    from storage.database import SNAPSHOT_TABLES, delete_snapshot, get_snapshot
+
+    keep = ingest_zip_bytes(make_zip({"k/a.py": b"x = 1\n"}), "keep")["snapshot_id"]
+    gone = ingest_zip_bytes(make_zip(SAMPLE), "gone")["snapshot_id"]
+    run_full_analysis(keep)
+    run_full_analysis(gone)
+    root = snapshot_root(get_snapshot(gone))
+
+    assert delete_snapshot(gone, service.REPOSITORIES_DIR) is True
+    assert get_snapshot(gone) is None and not root.exists()
+    with get_connection() as connection:
+        for table in SNAPSHOT_TABLES:
+            left = connection.execute(
+                f"SELECT count(*) FROM {table} WHERE snapshot_id = ?", (gone,)).fetchone()[0]
+            assert left == 0, table
+    assert get_snapshot(keep) is not None and load_report(keep) is not None
+    assert delete_snapshot(gone, service.REPOSITORIES_DIR) is False

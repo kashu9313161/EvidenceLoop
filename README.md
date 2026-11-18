@@ -20,10 +20,15 @@ python -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 cd web && npm install && npm run build && cd ..
-python -m cli.main serve             # then open http://localhost:8000
+python -m cli.main serve             # then open http://127.0.0.1:8000
 ```
 
-Checks: `ruff check .`, `pytest -q` (offline) and `npm run build` in `web/`.
+Checks: `ruff check .`, `pytest -q` (offline) `npm test` and `npm run build` in `web/`.
+
+Use `127.0.0.1` rather than `localhost`: on Windows `localhost` tries IPv6 first and adds a
+noticeable delay to every request. The server only answers on this machine. Without a token,
+GitHub allows 60 API requests an hour (about 30 analyses); set a `GITHUB_TOKEN` environment
+variable to raise that to 5,000.
 
 ## Learn more
 

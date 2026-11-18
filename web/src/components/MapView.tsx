@@ -107,8 +107,9 @@ export function MapView({ report, selected, onSelect, impactOn }: Props) {
       return { nodes, links }
     }
 
+    // Type-hint-only imports never run, so they aren't dependencies (and make no cycles).
     const edges = report.graph.edges.filter(
-      (e) => (showInferred || e.tier === 'confirmed') && (showTests || e.kind !== 'tests'),
+      (e) => !e.type_only && (showInferred || e.tier === 'confirmed') && (showTests || e.kind !== 'tests'),
     )
     const connected = new Set(edges.flatMap((e) => [e.source, e.target]))
     const nodes: MapNode[] = report.graph.nodes
@@ -369,7 +370,11 @@ export function MapView({ report, selected, onSelect, impactOn }: Props) {
       </div>
 
       {nodesCount === 0 ? (
-        <div className="map-empty">No files to draw with these settings.</div>
+        <div className="map-empty">
+          {report.graph.nodes.length === 0
+            ? 'This repository has no code files to map.'
+            : 'No files to draw with these settings.'}
+        </div>
       ) : (
         <ForceGraph2D<MapNode, MapLink>
           ref={graphRef}

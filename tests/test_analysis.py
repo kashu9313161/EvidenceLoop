@@ -241,7 +241,8 @@ def test_js_import_forms():
     assert ("import", "./api", "*", "api", 3) in refs
     assert ("import", "../lib/thing", "default", "Default", 4) in refs
     assert ("import", "../lib/thing", "named", None, 4) in refs
-    assert ("import", "./types", "Props", None, 5) in refs
+    # `import type` is erased at runtime, so the graph must not count it as a dependency.
+    assert ("type", "./types", "Props", None, 5) in refs
     assert ("side_effect", "./styles.css", None, None, 6) in refs
     assert ("require", "fs", None, None, 7) in refs
     assert ("dynamic", "./lazy", None, None, 8) in refs
@@ -259,8 +260,9 @@ def test_js_exports_and_reexports():
         export { helper, other as alias };
         export * from "./all";
         export { x as y } from "./xs";
+        export type { Shape } from "./shapes";
         """,
-        path="lib/index.js",
+        path="lib/index.ts",
     )
     exports = [(s.name, s.start_line) for s in facts.symbols if s.kind == "export"]
     reexports = [(r.module, r.name, r.alias) for r in facts.imports if r.kind == "reexport"]
@@ -272,7 +274,10 @@ def test_js_exports_and_reexports():
     assert ("helper", 4) in exports and ("alias", 4) in exports
     assert ("y", 6) in exports
     assert reexports == [("./all", "*", None), ("./xs", "x", "y")]
-    assert facts.language == "javascript"
+    types = [(r.module, r.name) for r in facts.imports if r.kind == "type"]
+    assert types == [("./shapes", "Shape")]
+    assert ("Shape", 7) in exports
+    assert facts.language == "typescript"
 
 
 def test_js_commented_imports_are_ignored_but_strings_are_kept():

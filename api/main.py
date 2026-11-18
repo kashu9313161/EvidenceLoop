@@ -1,28 +1,36 @@
 """EvidenceLoop HTTP API and web app host.
 
 Run from the repository root:  uvicorn api.main:app --port 8000
-then open http://localhost:8000 (the built React app is served from web/dist).
+then open http://127.0.0.1:8000 (the built React app is served from web/dist).
 """
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Annotated
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from analysis.pipeline import AnalysisError
 from analysis.understanding.report import ReportError, load_report, run_full_analysis
 from core.textio import decode_text
-from ingestion.service import IngestionError, ingest_github_repository, ingest_zip_bytes
+from ingestion.service import (
+    IngestionError,
+    ingest_github_repository,
+    ingest_zip_bytes,
+    parse_github_url,
+)
 from storage.database import (
     get_connection,
     get_snapshot,
@@ -36,6 +44,8 @@ from storage.database import (
 WEB_DIST = Path(__file__).resolve().parents[1] / "web" / "dist"
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+UNKNOWN_REPOSITORY = ("This repository isn't in EvidenceLoop any more. "
+                      "Analyse it again from the home page.")
 
 app = FastAPI(title="EvidenceLoop", version="2.0.0",
               description="Evidence-backed repository intelligence")
@@ -45,6 +55,42 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# A big repository's report is megabytes of JSON; compressed it is about a tenth.
+app.add_middleware(GZipMiddleware, minimum_size=2048)
+
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def allowed_hosts() -> set[str]:
+    """Host names this server answers to. `serve --host <name>` adds its own through
+    EVIDENCELOOP_ALLOWED_HOSTS (comma-separated), read per request so tests can set it."""
+    extra = os.environ.get("EVIDENCELOOP_ALLOWED_HOSTS", "")
+    return LOCAL_HOSTS | {h.strip().lower() for h in extra.split(",") if h.strip()}
+
+
+def _hostname(value: str) -> str:
+    """`127.0.0.1:8000` -> `127.0.0.1`, `[::1]:8000` -> `::1`, `http://x:5173` -> `x`."""
+    return (urlsplit(value if "//" in value else f"//{value}").hostname or "").lower()
+
+
+@app.middleware("http")
+async def local_requests_only(request: Request, call_next):
+    """This server holds the code of every analysed repository and has no login, so:
+    - answer only to its own host names, which stops DNS rebinding (a web page whose domain
+      is pointed at 127.0.0.1 reading the API);
+    - refuse changes sent from another site's page. Browsers send a cross-site form upload
+      without asking first, so CORS alone doesn't stop one.
+    """
+    hosts = allowed_hosts()
+    if _hostname(request.headers.get("host", "")) not in hosts:
+        return JSONResponse({"detail": "Unknown host name."}, status_code=421)
+    origin = request.headers.get("origin")
+    if request.method not in SAFE_METHODS and origin is not None \
+            and _hostname(origin) not in hosts:
+        return JSONResponse({"detail": "Requests from other sites are not accepted."},
+                            status_code=403)
+    return await call_next(request)
 
 
 # --------------------------------------------------------------------------- jobs
@@ -94,6 +140,11 @@ def _run(job: Job, ingest) -> None:
         _update(job, stage="fetch", message="Downloading and validating every file")
         result = ingest()
         _update(job, snapshot_id=result["snapshot_id"])
+        unchanged = result.get("already_downloaded") and not result.get("reanalyze")
+        if unchanged and load_report(result["snapshot_id"]) is not None:
+            # Same commit or same ZIP as before, already analysed by this version.
+            _update(job, stage="done", message="Already analysed", finished=time.time())
+            return
 
         def progress(stage: str, done: int, total: int, message: str) -> None:
             _update(job, stage=stage, done=done, total=total, message=message)
@@ -124,13 +175,19 @@ class AnalyzeRequest(BaseModel):
 def analyze(request: AnalyzeRequest) -> dict:
     if request.snapshot_id:
         if get_snapshot(request.snapshot_id) is None:
-            raise HTTPException(404, "Unknown snapshot")
+            raise HTTPException(404, UNKNOWN_REPOSITORY)
         snapshot_id = request.snapshot_id
-        job = _start(snapshot_id, lambda: {"snapshot_id": snapshot_id})
+        # An explicit re-run: analyse again even though a report exists.
+        job = _start(snapshot_id, lambda: {"snapshot_id": snapshot_id, "reanalyze": True})
     elif request.url and request.url.strip():
         url = request.url.strip()
         if not url.startswith("http"):
             url = f"https://github.com/{url.removeprefix('github.com/')}"
+        try:
+            owner, name = parse_github_url(url)
+            url = f"https://github.com/{owner}/{name}"  # what the progress box names
+        except IngestionError:
+            pass  # the job reports the error, so the page shows one message either way
         job = _start(url, lambda: ingest_github_repository(url))
     else:
         raise HTTPException(422, "Give a GitHub URL (or owner/repo) to analyze.")
@@ -189,7 +246,7 @@ def repos() -> list[dict]:
 def _require_snapshot(snapshot_id: str):
     snapshot = get_snapshot(snapshot_id)
     if snapshot is None:
-        raise HTTPException(404, "Unknown snapshot")
+        raise HTTPException(404, UNKNOWN_REPOSITORY)
     return snapshot
 
 

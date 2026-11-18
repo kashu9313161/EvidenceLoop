@@ -3,6 +3,14 @@
 Direction: an edge `A -> B` means "A imports B" (A depends on B). So:
 - fan-in of B  = distinct files that import B (how many depend on it)
 - impact of B  = everything that can reach B (what may break if B changes)
+
+Imports that exist only for type hints (Python `if TYPE_CHECKING:` blocks, TypeScript
+`import type`) never run. They are kept as edges, marked `type_only`, but left out of the
+networkx graph, so they don't create import cycles or inflate fan-in and impact.
+
+Imports inside a Python function body run when it's called, not when the module loads. They
+are real dependencies (kept in the graph), but cannot make an import cycle, so cycles are
+found among load-time imports only (`Edge.deferred` marks the others).
 """
 
 from __future__ import annotations
@@ -23,6 +31,8 @@ class Edge:
     tier: str  # confirmed | inferred
     lines: list[int] = field(default_factory=list)
     kind: str = "imports"  # imports | tests
+    type_only: bool = False  # every import behind this edge is for type hints only
+    deferred: bool = False  # every runtime import behind this edge is inside a function
 
 
 @dataclass
@@ -57,12 +67,28 @@ def is_test_path(path: str) -> bool:
     )
 
 
-def build_graph(code_files: list[str], imports_by_file: dict[str, list[dict]]) -> GraphResult:
-    """`imports_by_file[path]` rows carry kind, module, name, level, line (from the DB)."""
+def build_graph(
+    code_files: list[str],
+    imports_by_file: dict[str, list[dict]],
+    type_only_lines: dict[str, set[int]] | None = None,
+    js: JsResolver | None = None,
+    deferred_lines: dict[str, set[int]] | None = None,
+) -> GraphResult:
+    """`imports_by_file[path]` rows carry kind, module, name, level, line (from the DB).
+
+    `type_only_lines[path]` lists Python import lines inside `if TYPE_CHECKING:` blocks; rows
+    of kind "type" (TypeScript `import type`) are type-only too. `js` lets the caller pass a
+    resolver that knows the project's tsconfig aliases and package names.
+    `deferred_lines[path]` lists Python import lines inside function bodies.
+    """
     python_files = {p for p in code_files if p.endswith((".py", ".pyi"))}
     js_files = set(code_files) - python_files
     py = PythonResolver(python_files)
-    js = JsResolver(js_files)
+    js = js or JsResolver(js_files)
+    type_only_lines = type_only_lines or {}
+    deferred_lines = deferred_lines or {}
+    runtime: set[tuple[str, str]] = set()
+    load_time: set[tuple[str, str]] = set()
 
     graph = nx.DiGraph()
     graph.add_nodes_from(code_files)
@@ -91,6 +117,10 @@ def build_graph(code_files: list[str], imports_by_file: dict[str, list[dict]]) -
                     edge.tier = "confirmed"
                 if line not in edge.lines:
                     edge.lines.append(line)
+                if not (row.get("kind") == "type" or line in type_only_lines.get(importer, ())):
+                    runtime.add(key)
+                    if line not in deferred_lines.get(importer, ()):
+                        load_time.add(key)
             elif res.kind in ("stdlib", "external") and res.package:
                 use = externals.setdefault(res.package, ExternalUse(res.package, res.kind))
                 use.files.add(importer)
@@ -102,11 +132,15 @@ def build_graph(code_files: list[str], imports_by_file: dict[str, list[dict]]) -
     for (source, target), edge in edges.items():
         if is_test_path(source) and not is_test_path(target):
             edge.kind = "tests"
-        graph.add_edge(source, target)
+        edge.type_only = (source, target) not in runtime
+        edge.deferred = not edge.type_only and (source, target) not in load_time
+        if not edge.type_only:
+            graph.add_edge(source, target)
 
+    loading = graph.edge_subgraph(load_time)
     cycles = [
         sorted(component)
-        for component in nx.strongly_connected_components(graph)
+        for component in nx.strongly_connected_components(loading)
         if len(component) > 1
     ]
     cycles.sort(key=lambda c: (-len(c), c))
@@ -149,6 +183,22 @@ def importance(graph: nx.DiGraph, damping: float = 0.85, rounds: int = 100) -> d
         if delta < 1e-9:
             break
     return {node: rank.get(node, 0.0) for node in graph.nodes}
+
+
+# Folders of code that illustrates or measures the project rather than being it.
+SUPPORT_DIRS = {"examples", "example", "docs", "doc", "docs_src", "demo", "demos", "samples",
+                "sample", "playground", "benchmarks", "benchmark", "bench", "tutorial",
+                "tutorials", "cookbook"}
+
+
+def support_area(path: str) -> str | None:
+    """`docs_src/security/tutorial001.py` -> `docs_src`: the outermost example/docs folder
+    holding the file, or None for the project's own code."""
+    parts = PurePosixPath(path).parts[:-1]
+    for index, part in enumerate(parts):
+        if part.lower() in SUPPORT_DIRS:
+            return "/".join(parts[: index + 1])
+    return None
 
 
 def area_of(path: str, depth: int) -> str:

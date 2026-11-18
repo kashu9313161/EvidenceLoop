@@ -62,6 +62,12 @@ class InsightContext:
     entry_points: set[str]
     lines: dict[str, list[str]]
     utf16_files: list[str] = field(default_factory=list)
+    # Files a test reaches, directly or through a package's public API (see report.py).
+    # None: fall back to direct test imports.
+    tested: set[str] | None = None
+    # Example, docs and benchmark code: still checked for code problems, but nobody expects
+    # tests for it or that something imports it.
+    supporting: set[str] = field(default_factory=set)
 
 
 def _rank(insight: Insight, ctx: InsightContext) -> None:
@@ -76,7 +82,8 @@ def _cycles(ctx: InsightContext) -> list[Insight]:
         members = set(cycle)
         evidence = []
         for (source, target), edge in sorted(ctx.graph.edges.items()):
-            if source in members and target in members:
+            if (source in members and target in members and not edge.type_only
+                    and not edge.deferred):
                 line = edge.lines[0]
                 evidence.append(Evidence(source, line, line,
                                          f"{short_name(source)} imports {short_name(target)}"))
@@ -235,7 +242,8 @@ def _smells(ctx: InsightContext) -> list[Insight]:
 
 def _testing(ctx: InsightContext) -> list[Insight]:
     out = []
-    source = [p for p in ctx.files if not is_test_path(p) and ctx.files[p]["language"]]
+    source = [p for p in ctx.files if not is_test_path(p) and ctx.files[p]["language"]
+              and p not in ctx.supporting]
     if not ctx.has_tests:
         if len(source) >= 3:
             out.append(Insight(
@@ -249,7 +257,9 @@ def _testing(ctx: InsightContext) -> list[Insight]:
                 confidence="confirmed", files=[],
             ))
         return out
-    tested = {edge.target for edge in ctx.graph.edges.values() if edge.kind == "tests"}
+    tested = ctx.tested if ctx.tested is not None else {
+        edge.target for edge in ctx.graph.edges.values()
+        if edge.kind == "tests" and not edge.type_only}
     graph = ctx.graph.graph
     for path in source:
         if path.endswith(("__init__.py", ".d.ts")):
@@ -259,9 +269,10 @@ def _testing(ctx: InsightContext) -> list[Insight]:
             dependents = [short_name(p) for p in graph.predecessors(path) if not is_test_path(p)]
             out.append(Insight(
                 rule="untested_hub", category="Testing", severity="medium",
-                title=f"{short_name(path)} is widely used but no test imports it",
+                title=f"{short_name(path)} is widely used but no test reaches it",
                 summary=f"{plural(hub, 'file')} depend on {path} "
-                        f"({', '.join(dependents[:4])}), and no test file imports it directly.",
+                        f"({', '.join(dependents[:4])}), and no test imports it, directly or "
+                        "through its package.",
                 why="Changes here ripple into every file that depends on it; without a direct "
                     "test, those regressions surface somewhere else.",
                 suggestion=f"Add a focused test module for {short_name(path)} covering its public "
@@ -347,7 +358,7 @@ def _orphans(ctx: InsightContext) -> list[Insight]:
             or name in {"__init__.py", "__main__.py", "setup.py", "conftest.py", "manage.py"}
             or name.endswith((".d.ts", ".config.js", ".config.ts", ".config.mjs"))
             or not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx"))
-            or path.startswith(("docs/", "examples/", "scripts/"))
+            or path.startswith(("docs/", "examples/", "scripts/")) or path in ctx.supporting
         ):
             continue
         if graph.in_degree(path) == 0 and graph.out_degree(path) == 0:

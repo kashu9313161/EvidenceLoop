@@ -83,6 +83,9 @@ class PythonQuality:
     app_objects: list[tuple[str, str, int]] = field(default_factory=list)  # var, kind, line
     top_level_statements: int = 0  # executable statements at module level (script-ness)
     type_checking_lines: set[int] = field(default_factory=set)  # imports only for type hints
+    # Imports inside a function body: they run when it's called, not when the module loads,
+    # which is the usual way to break an import cycle.
+    deferred_lines: set[int] = field(default_factory=set)
     model_classes: int = 0  # classes deriving from a data/ORM base or dataclass
 
 
@@ -217,6 +220,10 @@ def analyze_python(source: str, lines: list[str] | None = None) -> PythonQuality
                 for sub_node in ast.walk(inner):
                     if isinstance(sub_node, ast.Import | ast.ImportFrom):
                         quality.type_checking_lines.add(sub_node.lineno)
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            for sub_node in ast.walk(node):
+                if isinstance(sub_node, ast.Import | ast.ImportFrom):
+                    quality.deferred_lines.add(sub_node.lineno)
 
     for statement in tree.body:
         if _is_main_guard(statement):

@@ -832,7 +832,9 @@ button.chip:hover {
   color: var(--paper);
 }
 
-.chip.on {
+.chip.on,
+button.chip.on:hover {
+  /* :hover must not turn the selected chip's text the same colour as its background */
   background: var(--paper);
   border-color: var(--paper);
   color: var(--ink);

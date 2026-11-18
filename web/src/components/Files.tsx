@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, type FileDetail, type FileInfo, type Report } from '../api'
+import { plainFileNote } from '../fileNote'
 import { fileName, plural } from '../util'
 import { Rich, Sev } from './bits'
 import { CodeBlock } from './CodeBlock'
@@ -227,6 +228,28 @@ export function Files({ report, path, line, onOpen, onOpenIssue }: Props) {
               </aside>
             </div>
           </>
+        ) : selectedPath && (detail || error) ? (
+          // Not analysed code (README, config, a skipped file): opened from search or a link.
+          <>
+            <header className="file-view-head">
+              <div className="path">{selectedPath}</div>
+              <h1>{selectedPath.split('/').pop()}</h1>
+              {detail && <p className="faint">{plainFileNote(detail.status, detail.reason)}</p>}
+            </header>
+            <div className="file-panels">
+              <div className="file-code" data-scroller>
+                {error && <p className="muted" style={{ padding: 24 }}>{error}</p>}
+                {detail && detail.content == null && (
+                  <p className="muted" style={{ padding: 24 }}>This file can't be shown (binary or too large).</p>
+                )}
+                {detail?.content != null && (
+                  <CodeBlock code={detail.content.replace(/\n$/, '')} path={selectedPath} focus={line} />
+                )}
+              </div>
+            </div>
+          </>
+        ) : selectedPath && !error ? (
+          <p className="faint" style={{ padding: 24 }}>Loading…</p>
         ) : (
           <div className="centered">Pick a file on the left.</div>
         )}

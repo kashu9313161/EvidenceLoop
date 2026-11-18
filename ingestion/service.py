@@ -11,7 +11,9 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 import zipfile
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
@@ -57,6 +59,10 @@ def sha256_bytes(data: bytes) -> str:
 # ---------------------------------------------------------------------------
 
 
+GITHUB_SUBPAGES = {"tree", "blob", "commit", "commits", "issues", "pulls", "pull", "actions",
+                   "releases", "tags", "branches", "wiki", "discussions"}
+
+
 def parse_github_url(url: str) -> tuple[str, str]:
     parsed = urlparse(url.strip())
 
@@ -69,10 +75,18 @@ def parse_github_url(url: str) -> tuple[str, str]:
     if parsed.port is not None:
         raise IngestionError("Custom ports are not allowed.")
 
-    if parsed.query or parsed.fragment:
-        raise IngestionError("Query parameters and fragments are not allowed.")
+    # GitHub's own repository links end in `?tab=readme-ov-file` or `#readme`; nothing else.
+    if parsed.query and not re.fullmatch(r"tab=[\w-]+", parsed.query):
+        raise IngestionError("Query parameters are not allowed.")
+    if parsed.fragment and not re.fullmatch(r"readme[\w-]*", parsed.fragment):
+        raise IngestionError("Fragments are not allowed.")
 
     parts = parsed.path.strip("/").split("/")
+
+    # A link copied from inside the repository (a folder, a file, its issues) names the
+    # repository in its first two segments; the whole repository is analysed.
+    if len(parts) > 2 and parts[2] in GITHUB_SUBPAGES and ".." not in parts:
+        parts = parts[:2]
 
     if len(parts) != 2:
         raise IngestionError("Expected exactly: https://github.com/owner/repository")
@@ -91,22 +105,44 @@ def parse_github_url(url: str) -> tuple[str, str]:
     return owner, repository
 
 
+def _github_refusal(response: httpx.Response, has_token: bool) -> str:
+    """Explain a 403/429 from GitHub: an exhausted hourly limit says when it resets."""
+    if response.headers.get("x-ratelimit-remaining") == "0":
+        reset = response.headers.get("x-ratelimit-reset", "")
+        when = ""
+        if reset.isdigit():
+            minutes = max(1, round((int(reset) - time.time()) / 60))
+            when = f" Try again in about {minutes} minute{'s' if minutes != 1 else ''}."
+        advice = "" if has_token else (
+            " Setting a GITHUB_TOKEN environment variable raises the limit from 60 to "
+            "5,000 requests an hour.")
+        return f"GitHub's hourly request limit is used up.{when}{advice}"
+    if response.status_code == 429 or response.headers.get("retry-after"):
+        return "GitHub is limiting requests right now. Wait a minute and try again."
+    return "GitHub refused access to this repository."
+
+
 def github_download(
     owner: str,
     name: str,
     transport: httpx.BaseTransport | None = None,
+    have_commit: Callable[[str], bool] | None = None,
 ) -> tuple[dict, str, bytes]:
     """Resolve the default branch to a commit SHA and download that zipball.
 
     The download is streamed and aborted as soon as it exceeds
     MAX_ARCHIVE_DOWNLOAD_BYTES, whatever Content-Length claims.
-    `transport` exists so tests can run without network access.
+    `transport` exists so tests can run without network access. When `have_commit(sha)`
+    says that commit is already stored, the archive isn't downloaded (empty bytes).
     """
 
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "EvidenceLoop-Local",
     }
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:  # optional: 5,000 API requests an hour instead of 60
+        headers["Authorization"] = f"Bearer {token}"
 
     try:
         with httpx.Client(
@@ -135,6 +171,9 @@ def github_download(
 
             if not commit_sha or not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
                 raise IngestionError("GitHub did not return a valid commit SHA.")
+
+            if have_commit is not None and have_commit(commit_sha):
+                return metadata, commit_sha, b""
 
             buffer = io.BytesIO()
 
@@ -166,12 +205,20 @@ def github_download(
                 "Repository not found or not publicly accessible."
             ) from exc
 
-        if status == 403:
-            raise IngestionError(
-                "GitHub API rate limit or access restriction."
-            ) from exc
+        if status in (403, 429):
+            raise IngestionError(_github_refusal(exc.response, bool(token))) from exc
 
-        raise IngestionError(f"GitHub returned HTTP {status}.") from exc
+        raise IngestionError(
+            f"GitHub returned an error (HTTP {status}). Try again in a moment."
+        ) from exc
+
+    except httpx.TimeoutException as exc:
+        raise IngestionError("GitHub took too long to respond. Try again in a moment.") from exc
+
+    except httpx.TransportError as exc:
+        raise IngestionError(
+            "Couldn't reach GitHub. Check your internet connection and try again."
+        ) from exc
 
     except (httpx.HTTPError, ValueError, KeyError, OSError) as exc:
         raise IngestionError(f"GitHub download failed: {exc}") from exc
@@ -631,9 +678,17 @@ def ingest_github_repository(
     transport: httpx.BaseTransport | None = None,
 ) -> dict:
     owner, name = parse_github_url(url)
-    _metadata, commit_sha, archive_bytes = github_download(owner, name, transport)
-
     repository_id = f"github:{owner}/{name}"
+
+    def destination_for(sha: str) -> Path:
+        return REPOSITORIES_DIR / f"{owner}_{name}" / sha
+
+    # Asking again for an unchanged repository costs two small API calls, not a re-download.
+    _metadata, commit_sha, archive_bytes = github_download(
+        owner, name, transport,
+        have_commit=lambda sha: _prepare_destination(f"{repository_id}@{sha}",
+                                                     destination_for(sha)),
+    )
 
     return _ingest_archive(
         archive_bytes=archive_bytes,
@@ -644,7 +699,7 @@ def ingest_github_repository(
         owner=owner,
         name=name,
         commit_sha=commit_sha,
-        destination=REPOSITORIES_DIR / f"{owner}_{name}" / commit_sha,
+        destination=destination_for(commit_sha),
     )
 
 

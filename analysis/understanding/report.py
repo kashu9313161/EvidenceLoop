@@ -25,7 +25,9 @@ from analysis.graph.builder import (
     impact,
     importance,
     is_test_path,
+    support_area,
 )
+from analysis.graph.resolver import JsResolver, js_aliases, package_names
 from analysis.python.quality import analyze_python
 from analysis.understanding import insights as insight_rules
 from analysis.understanding.profile import (
@@ -55,7 +57,7 @@ def distinct_names(paths: list[str]) -> list[str]:
     return out
 
 
-REPORT_VERSION = "2.2"
+REPORT_VERSION = "2.3"
 CODE_SUFFIXES = {".py": "Python", ".pyi": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
                  ".mjs": "JavaScript", ".cjs": "JavaScript", ".ts": "TypeScript",
                  ".tsx": "TypeScript"}
@@ -297,7 +299,8 @@ class _Build:
     has_ci: bool = False
     has_docker: bool = False
     stack: dict[str, dict] = field(default_factory=dict)
-    tests_of: dict[str, list[str]] = field(default_factory=dict)
+    tests_of: dict[str, list[str]] = field(default_factory=dict)  # direct test imports
+    tested: set[str] = field(default_factory=set)  # reached by a test, directly or via a package
     entry_points: set[str] = field(default_factory=set)
     insights: list[dict] = field(default_factory=list)
     per_file_insights: dict[str, list[str]] = field(default_factory=dict)
@@ -315,6 +318,29 @@ class _Build:
     @property
     def production(self) -> list[str]:
         return [p for p in self.files if not is_test_path(p)]
+
+    @property
+    def supporting(self) -> set[str]:
+        """Example, docs and benchmark code (`examples/`, `docs_src/`): analysed and mapped,
+        but not what the project is. Empty when the repository is nothing but such folders."""
+        found = {p for p in self.production if support_area(p) is not None}
+        return found if len(found) < len(self.production) else set()
+
+    @property
+    def core(self) -> list[str]:
+        """The project's own code: what the headline, entry points and rankings describe."""
+        supporting = self.supporting
+        return [p for p in self.production if p not in supporting]
+
+    @property
+    def core_entry_points(self) -> set[str]:
+        core = set(self.core)
+        return {p for p in self.entry_points if p in core}
+
+    @property
+    def declared_library(self) -> bool:
+        """The root manifest says this is a reusable library (see Manifest.library)."""
+        return any(m.library and m.directory == "" for m in self.manifests)
 
     @property
     def all_paths(self) -> list[str]:
@@ -381,7 +407,12 @@ def _measure(b: _Build) -> None:
 def _map(b: _Build) -> None:
     b.step("graph", 0, 1, "Resolving imports")
     analyzed = [f["relative_path"] for f in b.code_rows if f["status"] == "analyzed"]
-    b.graph_result = build_graph(analyzed, b.imports_by_file)
+    type_only_lines = {path: info["quality"].type_checking_lines
+                       for path, info in b.files.items() if info.get("quality")}
+    deferred_lines = {path: info["quality"].deferred_lines
+                      for path, info in b.files.items() if info.get("quality")}
+    b.graph_result = build_graph(analyzed, b.imports_by_file, type_only_lines,
+                                 js=_js_resolver(b, analyzed), deferred_lines=deferred_lines)
     for row in b.code_rows:
         if row["status"] == "failed":
             b.graph.add_node(row["relative_path"])
@@ -391,10 +422,54 @@ def _map(b: _Build) -> None:
     b.ranks = importance(b.graph)
     tests_of: dict[str, list[str]] = defaultdict(list)
     for edge in b.graph_result.edges.values():
-        if edge.kind == "tests":
+        if edge.kind == "tests" and not edge.type_only:
             tests_of[edge.target].append(edge.source)
     b.tests_of = tests_of
+    b.tested = _reached_through_packages(b.graph, set(tests_of))
     b.step("graph", 1, 1, f"{len(b.graph_result.edges)} connections")
+
+
+def _js_resolver(b: _Build, analyzed: list[str]) -> JsResolver:
+    """A JS/TS resolver that knows the project's tsconfig `paths` and its package names."""
+    aliases = []
+    manifests: dict[str, str] = {}
+    for row in b.all_files:
+        path = row["relative_path"]
+        name = PurePosixPath(path).name
+        if row["status"] == "skipped" or name not in {"tsconfig.json", "jsconfig.json",
+                                                       "package.json"}:
+            continue
+        text = _read_text(b.root, path)
+        if text is None:
+            continue
+        if name == "package.json":
+            manifests[path] = text
+        else:
+            aliases.extend(js_aliases(path, text))
+    js_files = {p for p in analyzed if not p.endswith((".py", ".pyi"))}
+    return JsResolver(js_files, aliases, package_names(manifests))
+
+
+def _is_package_entry(path: str) -> bool:
+    name = PurePosixPath(path)
+    return name.name == "__init__.py" or (name.stem == "index" and name.suffix in CODE_SUFFIXES)
+
+
+def _reached_through_packages(graph, direct: set[str]) -> set[str]:
+    """Files a test reaches: the ones it imports, plus everything a package entry file
+    (`__init__.py`, `index.ts`) it imports re-exports. `import click` in a test exercises
+    `click/core.py` even though no test names that file."""
+    reached = set(direct)
+    frontier = [p for p in direct if _is_package_entry(p)]
+    while frontier:
+        entry = frontier.pop()
+        for target in graph.successors(entry):
+            if target in reached or is_test_path(target):
+                continue
+            reached.add(target)
+            if _is_package_entry(target):
+                frontier.append(target)
+    return reached
 
 
 def _is_manifest(name: str) -> bool:
@@ -476,6 +551,7 @@ def _insights(b: _Build) -> None:
         files=b.files, graph=b.graph_result, manifests=b.manifests,
         has_tests=any(is_test_path(p) for p in b.files), has_ci=b.has_ci,
         entry_points=b.entry_points, lines=b.lines, utf16_files=b.utf16_files,
+        tested=b.tested, supporting=b.supporting,
     )
     per_file: dict[str, list[str]] = defaultdict(list)
     for number, insight in enumerate(insight_rules.generate(context), start=1):
@@ -513,20 +589,30 @@ def _area_description(b: _Build, members: list[str], key: str) -> str:
 
 
 def _areas(b: _Build) -> None:
-    depth = choose_area_depth(b.production or list(b.files))
-    b.area_for = {p: ("tests" if is_test_path(p) else area_of(p, depth)) for p in b.files}
+    depth = choose_area_depth(b.core or list(b.files))
+    supporting = b.supporting
+    # Each example/docs folder is one area, however many topics it holds (fastapi's
+    # docs_src/* would otherwise be 80 areas around a handful of real ones).
+    b.area_for = {p: ("tests" if is_test_path(p)
+                      else support_area(p) if p in supporting else area_of(p, depth))
+                  for p in b.files}
+    support_areas = {b.area_for[p] for p in supporting}
     members_of: dict[str, list[str]] = defaultdict(list)
     for path, area in b.area_for.items():
         members_of[area].append(path)
-    for (source, target) in b.graph_result.edges:
+    for (source, target), edge in b.graph_result.edges.items():
+        if edge.type_only:
+            continue
         a, c = b.area_for.get(source), b.area_for.get(target)
         if a and c and a != c:
             b.area_links[(a, c)] += 1
-    ordered = sorted(members_of.items(), key=lambda kv: (kv[0] == "tests", -len(kv[1]), kv[0]))
+    # The project's own areas first, then examples and docs, then tests.
+    ordered = sorted(members_of.items(), key=lambda kv: (
+        kv[0] == "tests", kv[0] in support_areas, -len(kv[1]), kv[0]))
     for area, members in ordered:
         key = max(members, key=lambda p: (b.ranks.get(p, 0), b.files[p]["loc"]))
         b.areas.append({
-            "name": area, "files": sorted(members),
+            "name": area, "files": sorted(members), "supporting": area in support_areas,
             "loc": sum(b.files[p]["loc"] for p in members),
             "roles": dict(Counter(b.files[p]["role"] for p in members)),
             "key_file": key, "description": _area_description(b, members, key),
@@ -560,12 +646,13 @@ def _flow_steps(b: _Build, entry: str) -> tuple[list[dict], int]:
 
 def _flows(b: _Build) -> None:
     graph = b.graph
-    b.entries = sorted(b.entry_points, key=lambda p: (-len(nx.descendants(graph, p)), p))
+    # A library is entered through its public API, not its release or docs scripts.
+    b.entries = [] if b.declared_library else sorted(
+        b.core_entry_points, key=lambda p: (-len(nx.descendants(graph, p)), p))
     if not b.entries:
         b.entries = sorted(
-            [p for p in b.production if PurePosixPath(p).name == "__init__.py"
-             and graph.out_degree(p) >= 2],
-            key=lambda p: (-graph.out_degree(p), p),
+            [p for p in b.core if _is_package_entry(p) and graph.out_degree(p) >= 2],
+            key=lambda p: (p.count("/"), -graph.out_degree(p), p),
         )[:3]
     for entry in b.entries[:8]:
         steps, reach = _flow_steps(b, entry)
@@ -576,11 +663,14 @@ def _flows(b: _Build) -> None:
             if entry in b.entry_points else "Public API",
             "reason": info.get("role_reason", ""), "steps": steps, "reach": reach,
         })
+    supporting = b.supporting
     for path, info in b.files.items():
         quality = info.get("quality")
         for route in (quality.routes if quality else []):
             b.routes.append({"method": route.method, "path": route.path,
-                             "handler": route.handler, "file": path, "line": route.line})
+                             "handler": route.handler, "file": path, "line": route.line,
+                             "supporting": path in supporting})
+    b.routes.sort(key=lambda r: r["supporting"])  # the project's own routes before tutorials'
 
 
 def _coverage(b: _Build) -> dict:
@@ -617,45 +707,58 @@ def _coverage(b: _Build) -> dict:
 
 def _kind(b: _Build) -> tuple[str, list[str]]:
     """What sort of project this is, plus the extra surfaces worth naming."""
-    packages = {p for info in b.files.values() for p in info["packages"]}
-    ui_kinds = sorted({info["role_reason"].split(" ")[0] for info in b.files.values()
+    # Judged on the project's own code: a library's React demo doesn't make it an app.
+    own = [b.files[p] for p in b.core]
+    core = set(b.core)
+    routes = [r for r in b.routes if r["file"] in core]
+    packages = {p for info in own for p in info["packages"]}
+    ui_kinds = sorted({info["role_reason"].split(" ")[0] for info in own
                        if info["role"] == "ui"})
-    if any(info["role"] == "component" for info in b.files.values()):
+    if any(info["role"] == "component" for info in own):
         ui_kinds.append("React" if "react" in packages else "web")
-    if packages & ML_PACKAGES:
+    if b.declared_library:
+        kind = "library"  # the root manifest says so, whatever its examples look like
+        ui_kinds = []
+    elif packages & ML_PACKAGES:
         kind = "machine-learning project"
-    elif b.routes:
+    elif routes:
         kind = "web service"
     elif ui_kinds:
         kind = "application"
-    elif any(m.kind == "pyproject" for m in b.manifests) and not b.entry_points:
+    elif any(m.kind == "pyproject" for m in b.manifests) and not b.core_entry_points:
         kind = "library"
-    elif b.entry_points:
+    elif b.core_entry_points:
         kind = "application"
     else:
         kind = "project"
     extras = []
-    if b.routes and kind != "web service":
-        extras.append(f"an HTTP API ({plural(len(b.routes), 'route')})")
+    if routes and kind not in {"web service", "library"}:
+        extras.append(f"an HTTP API ({plural(len(routes), 'route')})")
     if ui_kinds:
         extras.append(f"a {human_list(ui_kinds)} interface")
     return kind, extras
 
 
 def _headline(b: _Build, kind: str, extras: list[str]) -> str:
-    production = b.production
+    core = b.core
     name = b.repo.get("name") or b.snapshot_id
-    production_areas = len([a for a in b.areas if a["name"] != "tests"])
+    core_areas = len([a for a in b.areas if a["name"] != "tests" and not a["supporting"]])
+    supporting = len(b.supporting)
+    if not b.files:
+        return (f"{name} has no code EvidenceLoop can read: "
+                f"{plural(len(b.all_files), 'file')}, none in Python, JavaScript or TypeScript.")
     return (f"{name} is a {_main_language(b)} {kind}"
             + (f" with {human_list(extras)}" if extras else "")
-            + f": {plural(len(production), 'source file')}, "
-            f"{sum(b.files[p]['loc'] for p in production):,} lines of code"
-            + (f" in {plural(production_areas, 'area')}" if production_areas > 1 else "")
+            + f": {plural(len(core), 'source file')}, "
+            f"{sum(b.files[p]['loc'] for p in core):,} lines of code"
+            + (f" in {plural(core_areas, 'area')}" if core_areas > 1 else "")
+            + (f", plus {plural(supporting, 'example or docs file')}" if supporting else "")
             + ".")
 
 
 def _main_language(b: _Build) -> str:
-    languages = Counter(info["language"] for info in b.files.values())
+    languages = Counter(b.files[p]["language"] for p in b.core if b.files[p]["language"])
+    languages = languages or Counter(info["language"] for info in b.files.values())
     return languages.most_common(1)[0][0] if languages else "Code"
 
 
@@ -665,20 +768,23 @@ def _facts(b: _Build, top: list[str]) -> list[str]:
     if top and fan_in(graph, top[0]) >= 2:
         facts.append(f"{short_name(top[0])} is the most depended-on file "
                      f"(used by {plural(fan_in(graph, top[0]), 'file')}).")
-    if b.entry_points:
-        facts.append(f"It starts from {human_list(distinct_names(sorted(b.entry_points)))}.")
+    if b.core_entry_points and not b.declared_library:
+        facts.append(
+            f"It starts from {human_list(distinct_names(sorted(b.core_entry_points)))}.")
     elif b.entries:
         facts.append(f"Its public API is {human_list(distinct_names(b.entries))}.")
     test_files = [p for p in b.files if is_test_path(p)]
     if test_files:
         testable = [
-            p for p in b.production
+            p for p in b.core
             if b.files[p]["role"] not in {"docs", "config", "build", "stub", "script"}
             and any(s["kind"] != "module" for s in b.files[p]["symbols"])
         ]
-        tested = {t for t in b.tests_of if t in b.files}
-        facts.append(f"{plural(len(test_files), 'test file')} directly cover "
-                     f"{len(tested & set(testable))} of {len(testable)} modules.")
+        reached = len(b.tested & set(testable))
+        direct = len(set(b.tests_of) & set(testable))
+        via = f" ({direct} directly, the rest through the package)" if reached > direct else ""
+        facts.append(f"{plural(len(test_files), 'test file')} reach "
+                     f"{reached} of {len(testable)} modules{via}.")
     else:
         facts.append("There are no automated tests.")
     severities = Counter(i["severity"] for i in b.insights)
@@ -691,7 +797,7 @@ def _facts(b: _Build, top: list[str]) -> list[str]:
 
 def _summary(b: _Build, externals: list[dict]) -> dict:
     kind, extras = _kind(b)
-    top = sorted(b.production, key=lambda p: -b.ranks.get(p, 0))
+    top = sorted(b.core, key=lambda p: -b.ranks.get(p, 0))
     languages = Counter(info["language"] for info in b.files.values())
     language_loc: Counter[str] = Counter()
     for info in b.files.values():
@@ -717,10 +823,11 @@ def _summary(b: _Build, externals: list[dict]) -> dict:
             STACK_ORDER.index(s["category"]) if s["category"] in STACK_ORDER else 99,
             -s["files"], s["name"])),
         "totals": {
-            "files": len(b.all_files), "source_files": len(b.production),
+            "files": len(b.all_files), "source_files": len(b.core),
+            "supporting_files": len(b.supporting),
             "test_files": sum(1 for p in b.files if is_test_path(p)),
             "loc": sum(i["loc"] for i in b.files.values()),
-            "source_loc": sum(b.files[p]["loc"] for p in b.production),
+            "source_loc": sum(b.files[p]["loc"] for p in b.core),
             "functions": sum(len(q.functions) for q in qualities),
             "classes": sum(len(q.classes) for q in qualities),
             "connections": len(b.graph_result.edges),
@@ -784,7 +891,8 @@ def _graph_json(b: _Build, files_json: list[dict]) -> dict:
         "nodes": [{"id": f["path"], "name": f["name"], **{k: f[k] for k in node_keys},
                    "insights": len(f["insights"])} for f in files_json],
         "edges": [{"source": e.source, "target": e.target, "tier": e.tier, "kind": e.kind,
-                   "lines": e.lines} for e in b.graph_result.edges.values()],
+                   "type_only": e.type_only, "lines": e.lines}
+                  for e in b.graph_result.edges.values()],
         "area_edges": [{"source": a, "target": c, "edges": n}
                        for (a, c), n in sorted(b.area_links.items())],
     }

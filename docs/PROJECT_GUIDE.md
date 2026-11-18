@@ -58,7 +58,7 @@ source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 cd web && npm install && npm run build && cd ..
 
-python -m cli.main serve             # http://localhost:8000
+python -m cli.main serve             # http://127.0.0.1:8000
 ```
 
 Development with hot reload: `uvicorn api.main:app --reload --port 8000` and, in `web/`, `npm run dev`

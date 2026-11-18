@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { api, type Job, type RepoSummary, workspacePath } from '../api'
 import { Logo, ThemeToggle } from '../components/bits'
+import { jobOutcome } from '../jobOutcome'
 import { plural } from '../util'
 
 const STEPS = [
@@ -51,33 +52,36 @@ export function Home() {
     api.repos().then(setRepos).catch(() => setRepos([]))
   }, [])
 
+  // Acts on every job the page receives: the first response may already be finished.
+  const receive = useCallback((next: Job) => {
+    const outcome = jobOutcome(next)
+    if (outcome.kind === 'open') {
+      navigate(workspacePath(outcome.snapshotId))
+    } else if (outcome.kind === 'failed') {
+      setError(outcome.message)
+      setJob(null)
+    } else {
+      setJob(next)
+    }
+  }, [navigate])
+
   useEffect(() => {
-    if (!job || job.stage === 'done' || job.stage === 'error') return
+    if (!job || jobOutcome(job).kind !== 'running') return
     const timer = window.setTimeout(async () => {
       try {
-        const next = await api.job(job.id)
-        if (next.stage === 'done' && next.snapshot_id) {
-          navigate(workspacePath(next.snapshot_id))
-          return
-        }
-        if (next.stage === 'error') {
-          setError(next.error ?? 'The analysis failed.')
-          setJob(null)
-          return
-        }
-        setJob(next)
+        receive(await api.job(job.id))
       } catch (e) {
         setError((e as Error).message)
         setJob(null)
       }
     }, 450)
     return () => window.clearTimeout(timer)
-  }, [job, navigate])
+  }, [job, receive])
 
   const start = async (run: () => Promise<Job>) => {
     setError(null)
     try {
-      setJob(await run())
+      receive(await run())
     } catch (e) {
       setError((e as Error).message)
     }

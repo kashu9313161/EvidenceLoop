@@ -1,6 +1,7 @@
 import io
 import json
 import stat
+import time
 import zipfile
 
 import httpx
@@ -67,6 +68,20 @@ def test_parse_github_url_with_git_suffix():
 @pytest.mark.parametrize(
     "url",
     [
+        "https://github.com/psf/requests/tree/main/src/requests",
+        "https://github.com/psf/requests/blob/main/README.md",
+        "https://github.com/psf/requests/issues",
+        "https://github.com/psf/requests?tab=readme-ov-file",
+        "https://github.com/psf/requests#readme",
+    ],
+)
+def test_links_copied_from_github_name_the_repository(url):
+    assert parse_github_url(url) == ("psf", "requests")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
         "http://github.com/psf/requests",
         "https://evil.com/psf/requests",
         "https://github.com.evil.com/psf/requests",
@@ -74,6 +89,8 @@ def test_parse_github_url_with_git_suffix():
         "https://github.com/owner/repo/../../other",
         "https://github.com/psf/requests?query=value",
         "https://github.com/psf/requests#fragment",
+        "https://github.com/psf/requests/tree/../../other",
+        "https://github.com/psf/requests/settings",
         "https://github.com:8080/psf/requests",
         "https://github.com/../requests",
     ],
@@ -422,11 +439,49 @@ def test_github_download_rejects_invalid_sha():
 
 @pytest.mark.parametrize(
     ("status", "message"),
-    [(404, "not found"), (403, "rate limit"), (500, "HTTP 500")],
+    [(404, "not found"), (403, "refused access"), (429, "limiting requests"),
+     (500, "HTTP 500")],
 )
 def test_github_download_maps_http_errors(status, message):
     with pytest.raises(IngestionError, match=message):
         github_download("owner", "repo", transport=github_transport(b"", status=status))
+
+
+def test_an_exhausted_rate_limit_says_when_and_how(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    reset = str(int(time.time()) + 25 * 60)
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        403, headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": reset}))
+    with pytest.raises(IngestionError) as error:
+        github_download("owner", "repo", transport=transport)
+    text = str(error.value)
+    assert "hourly request limit is used up" in text
+    assert "about 25 minutes" in text and "GITHUB_TOKEN" in text
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [(httpx.ConnectError("getaddrinfo failed"), "Check your internet connection"),
+     (httpx.ReadTimeout("slow"), "took too long")],
+)
+def test_network_failures_read_as_plain_advice(failure, message):
+    def handler(request):
+        raise failure
+    with pytest.raises(IngestionError, match=message) as error:
+        github_download("owner", "repo", transport=httpx.MockTransport(handler))
+    assert "getaddrinfo" not in str(error.value)
+
+
+def test_a_github_token_is_sent_when_set(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token-value")
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(404)
+    with pytest.raises(IngestionError):
+        github_download("owner", "repo", transport=httpx.MockTransport(handler))
+    assert seen == ["Bearer test-token-value"]
 
 
 # ---------------------------------------------------------------------------
@@ -456,10 +511,19 @@ def test_ingest_github_repository_end_to_end(isolated_storage):
     coverage = {row["relative_path"]: row["status"] for row in get_coverage(snapshot_id)}
     assert coverage == {"src/app.py": "pending", "logo.png": "skipped"}
 
+    requested: list[str] = []
+    fake = github_transport(archive)
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        return fake.handle_request(request)
+
     again = ingest_github_repository(
-        "https://github.com/owner/repo", transport=github_transport(archive)
+        "https://github.com/owner/repo", transport=httpx.MockTransport(counting)
     )
     assert again["already_downloaded"] is True
+    # The commit is already stored: no archive download, just the two lookups.
+    assert requested == ["/repos/owner/repo", "/repos/owner/repo/commits/main"]
 
 
 def test_ingest_zip_file_end_to_end(isolated_storage):

@@ -94,12 +94,16 @@ export interface GraphEdge {
   target: string
   tier: 'confirmed' | 'inferred'
   kind: 'imports' | 'tests'
+  /** Only imported for type hints: never runs, so not a dependency. */
+  type_only: boolean
   lines: number[]
 }
 
 export interface Area {
   name: string
   files: string[]
+  /** An examples/docs folder rather than the project's own code. */
+  supporting: boolean
   loc: number
   roles: Record<string, number>
   key_file: string
@@ -129,6 +133,7 @@ export interface Route {
   handler: string
   file: string
   line: number
+  supporting: boolean
 }
 
 export interface StackItem {
@@ -157,6 +162,7 @@ export interface Report {
     totals: {
       files: number
       source_files: number
+      supporting_files: number
       test_files: number
       loc: number
       source_loc: number

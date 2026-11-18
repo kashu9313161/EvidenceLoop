@@ -12,16 +12,39 @@ or internal-but-unresolved (a name that looks like one of the repository's own p
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+
+from analysis.javascript.shallow import blank_comments
 
 PY_SUFFIXES = (".py", ".pyi")
 JS_PROBE = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts",
             "/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs")
 ASSET_SUFFIXES = {".css", ".scss", ".sass", ".less", ".svg", ".png", ".jpg", ".jpeg", ".gif",
                   ".webp", ".ico", ".woff", ".woff2", ".ttf", ".json", ".md", ".html", ".wasm"}
-STDLIB = set(getattr(sys, "stdlib_module_names", ())) | {"__future__"}
+# Plus modules newer than the running Python (3.14 added these), so code written for a newer
+# version isn't told it has undeclared dependencies.
+STDLIB = set(getattr(sys, "stdlib_module_names", ())) | {"__future__", "annotationlib",
+                                                         "compression"}
+# Node's own modules (`import path from 'path'`): part of the runtime, never a dependency.
+NODE_BUILTINS = {
+    "assert", "async_hooks", "buffer", "child_process", "cluster", "console", "constants",
+    "crypto", "dgram", "diagnostics_channel", "dns", "domain", "events", "fs", "http", "http2",
+    "https", "inspector", "module", "net", "os", "path", "perf_hooks", "process", "punycode",
+    "querystring", "readline", "repl", "stream", "string_decoder", "sys", "timers", "tls",
+    "trace_events", "tty", "url", "util", "v8", "vm", "wasi", "worker_threads", "zlib",
+}
+
+
+@dataclass(frozen=True)
+class Alias:
+    """One tsconfig `paths` entry: `"zustand/*": ["./src/*.ts"]`, targets as repo paths."""
+
+    pattern: str
+    targets: tuple[str, ...]
 
 
 def _module_stem(path: str) -> str:
@@ -66,6 +89,11 @@ class PythonResolver:
                 return candidate
         return None
 
+    def _in_package(self, importer: str) -> bool:
+        folder = PurePosixPath(importer).parent
+        return str(folder) != "." and any(f"{folder}/__init__{s}" in self.files
+                                          for s in PY_SUFFIXES)
+
     def _roots_for(self, importer: str) -> list[str]:
         """Nearest first: the importer's own directory and its ancestors, then standard roots."""
         roots: list[str] = []
@@ -84,10 +112,16 @@ class PythonResolver:
     def _absolute(self, importer: str, dotted: str) -> tuple[str | None, str]:
         """Resolve `a.b.c` (deepest existing prefix). Returns (file, tier)."""
         parts = dotted.split(".")
+        roots = self._roots_for(importer)
+        if parts[0] in STDLIB and self._in_package(importer):
+            # Python 3 never searches a package module's own folder for absolute imports:
+            # `from types import X` in click/_compat.py is the standard library, not
+            # click/types.py. (A loose script's folder is on sys.path, so it can shadow.)
+            roots = self.standard_roots
         for cut in range(len(parts), 0, -1):
             module = ".".join(parts[:cut])
             hits: list[str] = []
-            for root in self._roots_for(importer):
+            for root in roots:
                 found = self._module_file(root, module)
                 if found and found not in hits:
                     hits.append(found)
@@ -137,8 +171,47 @@ class PythonResolver:
 
 
 class JsResolver:
-    def __init__(self, files: set[str]):
+    def __init__(self, files: set[str], aliases: list[Alias] | None = None,
+                 packages: dict[str, str] | None = None):
         self.files = files
+        # Longest pattern first, as TypeScript picks the most specific `paths` entry.
+        self.aliases = sorted(aliases or [], key=lambda a: -len(a.pattern))
+        self.packages = packages or {}  # the repository's own package names -> directory
+
+    def _from_alias(self, specifier: str) -> str | None:
+        for alias in self.aliases:
+            head, star, tail = alias.pattern.partition("*")
+            if star:
+                if not (specifier.startswith(head) and specifier.endswith(tail)
+                        and len(specifier) >= len(head) + len(tail)):
+                    continue
+                middle = specifier[len(head): len(specifier) - len(tail)]
+            elif specifier != alias.pattern:
+                continue
+            else:
+                middle = ""
+            for target in alias.targets:
+                normal = self._normalize(target.replace("*", middle, 1))
+                found = self._probe(normal) if normal is not None else None
+                if found:
+                    return found
+        return None
+
+    def _from_own_package(self, specifier: str) -> str | None:
+        """`zustand/vanilla` inside the zustand repository: its own source, not node_modules."""
+        for name, directory in sorted(self.packages.items(), key=lambda p: -len(p[0])):
+            if specifier != name and not specifier.startswith(name + "/"):
+                continue
+            rest = specifier[len(name):].lstrip("/")
+            prefix = f"{directory}/" if directory else ""
+            bases = ([f"{prefix}src/{rest}", f"{prefix}{rest}", f"{prefix}lib/{rest}"] if rest
+                     else [f"{prefix}src/index", f"{prefix}index", f"{prefix}lib/index",
+                           f"{prefix}src/{PurePosixPath(name).name}"])
+            for base in bases:
+                found = self._probe(base)
+                if found:
+                    return found
+        return None
 
     def _probe(self, base: str) -> str | None:
         for suffix in JS_PROBE:
@@ -171,6 +244,9 @@ class JsResolver:
             if found:
                 return Resolution("internal", found)
             return Resolution("unresolved", package=specifier)
+        found = self._from_alias(specifier)
+        if found:  # declared in tsconfig/jsconfig `paths`, so not a guess
+            return Resolution("internal", found)
         if specifier.startswith(("@/", "~/")):
             rest = specifier[2:]
             for base in (f"src/{rest}", rest):
@@ -180,6 +256,58 @@ class JsResolver:
             return Resolution("unresolved", package=specifier)
         if specifier.startswith("node:"):
             return Resolution("stdlib", package=specifier[5:].split("/")[0])
+        found = self._from_own_package(specifier)
+        if found:  # matched by package name and folder layout: a best guess
+            return Resolution("internal", found, tier="inferred")
         parts = specifier.split("/")
         package = "/".join(parts[:2]) if specifier.startswith("@") else parts[0]
+        if package in NODE_BUILTINS:
+            return Resolution("stdlib", package=package)
         return Resolution("external", package=package)
+
+
+def _loads_jsonc(text: str):
+    """tsconfig/jsconfig allow comments and trailing commas; plain json.loads does not."""
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", blank_comments(text))
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+
+
+def js_aliases(config_path: str, text: str) -> list[Alias]:
+    """`compilerOptions.paths` from one tsconfig.json/jsconfig.json, as repository paths.
+
+    Targets are relative to `baseUrl` (itself relative to the config file), or to the config
+    file when there is no `baseUrl`. `extends` is not followed.
+    """
+    data = _loads_jsonc(text)
+    options = data.get("compilerOptions") if isinstance(data, dict) else None
+    paths = options.get("paths") if isinstance(options, dict) else None
+    if not isinstance(paths, dict):
+        return []
+    config_dir = PurePosixPath(config_path).parent
+    base = config_dir / str(options.get("baseUrl") or ".")
+    aliases = []
+    for pattern, targets in paths.items():
+        if not isinstance(pattern, str) or not isinstance(targets, list):
+            continue
+        resolved = tuple(str(base / t) for t in targets if isinstance(t, str))
+        if resolved:
+            aliases.append(Alias(pattern, resolved))
+    return aliases
+
+
+def package_names(manifests: dict[str, str]) -> dict[str, str]:
+    """`name` of every package.json in the repository -> its directory (`""` for the root)."""
+    names: dict[str, str] = {}
+    for path, text in manifests.items():
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        name = data.get("name") if isinstance(data, dict) else None
+        if isinstance(name, str) and re.fullmatch(r"(@[\w.-]+/)?[\w.-]+", name):
+            parent = str(PurePosixPath(path).parent)
+            names.setdefault(name, "" if parent == "." else parent)
+    return names

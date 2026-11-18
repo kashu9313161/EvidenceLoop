@@ -18,14 +18,14 @@ _Q = r"(?P<q>['\"])(?P<mod>[^'\"\n]+)(?P=q)"
 _START = r"(?<![.\w$])"
 
 IMPORT_FROM = re.compile(
-    _START + r"import\s+(?:type\s+)?(?P<clause>[\w$*{}\s,]+?)\s*from\s*" + _Q
+    _START + r"import\s+(?P<type>type\s+)?(?P<clause>[\w$*{}\s,]+?)\s*from\s*" + _Q
 )
 SIDE_EFFECT = re.compile(_START + r"import\s*" + _Q)
 DYNAMIC = re.compile(_START + r"import\s*\(\s*" + _Q + r"\s*\)")
 REQUIRE = re.compile(_START + r"require\s*\(\s*" + _Q + r"\s*\)")
 REEXPORT = re.compile(
     _START
-    + r"export\s+(?:type\s+)?(?P<clause>\*(?:\s+as\s+[\w$]+)?|\{[^}]*\})\s*from\s*"
+    + r"export\s+(?P<type>type\s+)?(?P<clause>\*(?:\s+as\s+[\w$]+)?|\{[^}]*\})\s*from\s*"
     + _Q
 )
 EXPORT_DECL = re.compile(
@@ -129,8 +129,8 @@ def extract_file(relative_path: str, source: str) -> FileFacts:
         line = line_at(match.start())
         for name, alias in _clause_imports(match.group("clause")):
             imports.append(
-                ImportRef(kind="import", module=match.group("mod"), name=name, alias=alias,
-                          line=line)
+                ImportRef(kind="type" if match.group("type") else "import",
+                          module=match.group("mod"), name=name, alias=alias, line=line)
             )
 
     for pattern, kind in ((SIDE_EFFECT, "side_effect"), (DYNAMIC, "dynamic"),
@@ -150,8 +150,8 @@ def extract_file(relative_path: str, source: str) -> FileFacts:
             pairs = _split_names(clause.strip("{}"))
         for name, alias in pairs:
             imports.append(
-                ImportRef(kind="reexport", module=match.group("mod"), name=name, alias=alias,
-                          line=line)
+                ImportRef(kind="type" if match.group("type") else "reexport",
+                          module=match.group("mod"), name=name, alias=alias, line=line)
             )
             exported = alias or name
             if exported != "*":

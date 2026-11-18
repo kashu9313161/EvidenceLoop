@@ -1,4 +1,5 @@
 import json
+import shutil
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -235,6 +236,36 @@ def snapshot_root(snapshot) -> Path | None:
     if candidate.is_dir():
         return candidate.resolve()
     return None
+
+
+SNAPSHOT_TABLES = ("files", "files_fts", "file_stages", "symbols", "symbols_fts", "imports",
+                   "calls", "graph_nodes", "graph_edges", "analysis_runs", "analysis_reports")
+
+
+def delete_snapshot(snapshot_id: str, repositories_dir: Path | None = None) -> bool:
+    """Remove a snapshot: every row about it, its repository row when no other snapshot uses
+    it, and its extracted files (only when they live under the repositories directory).
+    Returns False if there was no such snapshot."""
+    snapshot = get_snapshot(snapshot_id)
+    if snapshot is None:
+        return False
+    root = snapshot_root(snapshot)
+    with get_connection() as connection:
+        for table in SNAPSHOT_TABLES:
+            connection.execute(f"DELETE FROM {table} WHERE snapshot_id = ?", (snapshot_id,))
+        connection.execute("DELETE FROM snapshots WHERE snapshot_id = ?", (snapshot_id,))
+        connection.execute(
+            "DELETE FROM repositories WHERE repository_id = ? AND NOT EXISTS "
+            "(SELECT 1 FROM snapshots WHERE repository_id = ?)",
+            (snapshot["repository_id"], snapshot["repository_id"]),
+        )
+    base = Path(repositories_dir or config.REPOSITORIES_DIR).resolve()
+    if root is not None and root != base and root.is_relative_to(base):
+        shutil.rmtree(root, ignore_errors=True)
+        parent = root.parent
+        if parent != base and parent.is_relative_to(base) and not any(parent.iterdir()):
+            parent.rmdir()  # the repository's folder, now empty
+    return True
 
 
 def get_coverage(snapshot_id: str):

@@ -23,7 +23,7 @@ ruff check .                                   # lint (CI runs this; line length
 pytest -q                                      # all tests (offline)
 pytest tests/test_ingestion.py::test_reject_path_traversal -q   # single test
 
-python -m cli.main serve                                  # web app on http://localhost:8000
+python -m cli.main serve                                  # web app on http://127.0.0.1:8000
 python -m cli.main analyze https://github.com/owner/repo  # or owner/repo, or a local .zip
 python -m cli.main report "<snapshot_id>"                 # headline, areas, issues as text
 python -m cli.main coverage "<snapshot_id>"

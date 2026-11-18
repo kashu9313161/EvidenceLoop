@@ -5,7 +5,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 SymbolKind = Literal["module", "class", "function", "method", "export"]
-ImportKind = Literal["import", "from", "require", "dynamic", "reexport", "side_effect"]
+# "type": TypeScript `import type` / `export type ... from`, erased at runtime.
+ImportKind = Literal["import", "from", "require", "dynamic", "reexport", "side_effect", "type"]
 
 
 class Symbol(BaseModel):

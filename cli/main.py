@@ -1,6 +1,6 @@
 """EvidenceLoop command line.
 
-    python -m cli.main serve                      # open the web app on http://localhost:8000
+    python -m cli.main serve                      # open the web app on http://127.0.0.1:8000
     python -m cli.main analyze https://github.com/owner/repo   (or a local .zip path)
     python -m cli.main report  "<snapshot_id>"    # headline, structure and issues as text
     python -m cli.main list                       # every analysed repository
@@ -8,6 +8,8 @@
 
 import argparse
 import json
+import os
+import socket
 import sys
 from pathlib import Path
 
@@ -30,6 +32,38 @@ def _print_report(report: dict) -> None:
         where = issue["evidence"][0] if issue["evidence"] else None
         location = f"  {where['path']}:{where['start']}" if where else ""
         print(f"[{issue['severity']:<6}] {issue['title']}{location}")
+
+
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+def port_in_use(host: str, port: int) -> bool:
+    bind_host = "0.0.0.0" if host in {"", "0.0.0.0"} else host
+    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((bind_host, port))
+        except OSError:
+            return True
+    return False
+
+
+def _serve(host: str, port: int) -> None:
+    import uvicorn
+
+    if port_in_use(host, port):
+        raise SystemExit(f"Port {port} is already in use. Is EvidenceLoop already running? "
+                         f"Open http://127.0.0.1:{port}, or start on another port with "
+                         f"--port {port + 1}.")
+    if host not in LOOPBACK:
+        # The server must answer to the name people will use to reach it.
+        names = {host} if host not in {"", "0.0.0.0", "::"} else {socket.gethostname()}
+        os.environ["EVIDENCELOOP_ALLOWED_HOSTS"] = ",".join(sorted(names))
+        print("Warning: EvidenceLoop has no login. Anyone who can reach this address can "
+              "read every analysed repository.", file=sys.stderr)
+    shown = "127.0.0.1" if host in LOOPBACK else host
+    print(f"EvidenceLoop is running on http://{shown}:{port}")
+    uvicorn.run("api.main:app", host=host, port=port)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -58,10 +92,7 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         if args.command == "serve":
-            import uvicorn
-
-            print(f"EvidenceLoop is running on http://{args.host}:{args.port}")
-            uvicorn.run("api.main:app", host=args.host, port=args.port)
+            _serve(args.host, args.port)
 
         elif args.command == "analyze":
             source = args.source
