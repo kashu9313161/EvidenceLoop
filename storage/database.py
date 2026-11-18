@@ -2,6 +2,7 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 from core import config
 
@@ -164,6 +165,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
 );
 
 -- One row per analysis run that finished (latest wins in the UI).
+CREATE TABLE IF NOT EXISTS analysis_reports (
+    snapshot_id TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    report TEXT NOT NULL,
+    FOREIGN KEY (snapshot_id)
+        REFERENCES snapshots(snapshot_id)
+);
+
 CREATE TABLE IF NOT EXISTS analysis_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     snapshot_id TEXT NOT NULL,
@@ -198,6 +208,7 @@ def initialize_database() -> None:
 
 
 def get_snapshot(snapshot_id: str):
+    initialize_database()
     with get_connection() as connection:
         return connection.execute(
             """
@@ -207,6 +218,23 @@ def get_snapshot(snapshot_id: str):
             """,
             (snapshot_id,),
         ).fetchone()
+
+
+def snapshot_root(snapshot) -> Path | None:
+    """The snapshot's files on disk, or None if they are gone.
+
+    `root_path` is absolute, so it breaks when the project folder moves to another place or
+    machine. Snapshots always live at `<repositories>/<repo dir>/<snapshot dir>`, so fall back
+    to that layout under the current repositories directory.
+    """
+    stored = Path(snapshot["root_path"])
+    if stored.is_dir():
+        return stored.resolve()
+    parts = str(snapshot["root_path"]).replace("\\", "/").rstrip("/").split("/")
+    candidate = Path(config.REPOSITORIES_DIR, *parts[-2:])
+    if candidate.is_dir():
+        return candidate.resolve()
+    return None
 
 
 def get_coverage(snapshot_id: str):

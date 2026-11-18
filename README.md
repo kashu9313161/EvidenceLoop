@@ -1,31 +1,31 @@
 # EvidenceLoop
 
-**Ask a codebase questions and get answers you can check.**
+**Understand a codebase before you change it.**
 
-EvidenceLoop is a local-first codebase intelligence tool. It turns a public GitHub repository or a ZIP into an immutable,
-commit-pinned snapshot. It analyzes the snapshot without ever running its code, maps how the code connects in an
-Obsidian-style graph, and answers questions with claims that cite exact files and lines. Each claim is checked before
-you see it. It also shows what it did **not** analyze, and it never collapses everything into a single "health score".
+Paste a GitHub repository (or drop a ZIP). EvidenceLoop reads every file, maps how they connect, explains the
+project in plain English, and points out what needs fixing, with the exact lines as proof. Nothing from the
+repository is ever run.
 
-- **What it is and how it works:** [docs/PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md)
-- **What we're building, in order:** [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)
+- **Overview:** what the project is, how it's organised, where it starts, what to fix first.
+- **Map:** an Obsidian-style graph of every file and import. Hover to trace, click for details, and see everything a
+  change would reach.
+- **Issues:** import cycles, overly complex functions, silenced errors, untested hubs, undeclared or unpinned
+  dependencies and more, ranked by how far each one spreads.
+- **Files:** the code with each file's role, description, functions and complexity.
 
 ## Quick start
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate            # Windows. On macOS/Linux: source .venv/bin/activate
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-
-python -m cli.main ingest https://github.com/pallets/itsdangerous
-streamlit run app/streamlit_app.py
+cd web && npm install && npm run build && cd ..
+python -m cli.main serve             # then open http://localhost:8000
 ```
 
-Run the checks with `ruff check .` and `pytest -q`. The tests run fully offline.
+Checks: `ruff check .`, `pytest -q` (offline) and `npm run build` in `web/`.
 
-## Status
+## Learn more
 
-Ingestion, ingestion hardening, the app shell (add a repository, snapshot overview, coverage ledger, light and
-dark themes) and code analysis (Python symbols, imports and calls; JS/TS imports and exports; full-text search
-index) are done. Next up: the knowledge graph, then the Obsidian-style graph page.
-See the [implementation plan](docs/IMPLEMENTATION_PLAN.md) for everything after that.
+- [docs/PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md): how it works, concepts, safety, adding a rule.
+- [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md): what's built and what comes next.

@@ -1,77 +1,112 @@
+"""EvidenceLoop command line.
+
+    python -m cli.main serve                      # open the web app on http://localhost:8000
+    python -m cli.main analyze https://github.com/owner/repo   (or a local .zip path)
+    python -m cli.main report  "<snapshot_id>"    # headline, structure and issues as text
+    python -m cli.main list                       # every analysed repository
+"""
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from analysis.pipeline import AnalysisError, analyze_snapshot
-from ingestion.service import (
-    IngestionError,
-    ingest_github_repository,
-    ingest_zip_file,
-)
-from storage.database import get_coverage, get_snapshot
+from analysis.pipeline import AnalysisError
+from analysis.understanding.report import ReportError, load_report, run_full_analysis
+from ingestion.service import IngestionError, ingest_github_repository, ingest_zip_file
+from storage.database import get_coverage, get_snapshot, list_snapshots
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        prog="evidenceloop",
-        description="EvidenceLoop repository ingestion CLI",
-    )
+def _print_report(report: dict) -> None:
+    summary = report["summary"]
+    print(summary["headline"])
+    print()
+    print(" ".join(summary["facts"]))
+    print()
+    for area in report["architecture"]["areas"]:
+        print(f"  {area['name']}: {area['description']}")
+    print()
+    for issue in report["insights"]:
+        where = issue["evidence"][0] if issue["evidence"] else None
+        location = f"  {where['path']}:{where['start']}" if where else ""
+        print(f"[{issue['severity']:<6}] {issue['title']}{location}")
 
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="evidenceloop",
+                                     description="Understand a codebase before you change it.")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    ingest_parser = commands.add_parser("ingest")
-    ingest_parser.add_argument("source", help="GitHub URL or local ZIP path")
+    serve = commands.add_parser("serve", help="Run the web app")
+    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--host", default="127.0.0.1")
 
-    coverage_parser = commands.add_parser("coverage")
-    coverage_parser.add_argument("snapshot_id")
+    analyze = commands.add_parser("analyze", help="Ingest and analyse a repository")
+    analyze.add_argument("source", help="GitHub URL, owner/repo, a local .zip, or a snapshot id")
+    analyze.add_argument("--json", action="store_true", help="Print the full report as JSON")
 
-    show_parser = commands.add_parser("snapshot")
-    show_parser.add_argument("snapshot_id")
+    report = commands.add_parser("report", help="Print the analysis of a snapshot")
+    report.add_argument("snapshot_id")
+    report.add_argument("--json", action="store_true")
 
-    analyze_parser = commands.add_parser("analyze")
-    analyze_parser.add_argument("snapshot_id")
+    commands.add_parser("list", help="List analysed repositories")
 
-    args = parser.parse_args()
+    coverage = commands.add_parser("coverage", help="Per-file analysis status")
+    coverage.add_argument("snapshot_id")
+
+    args = parser.parse_args(argv)
 
     try:
-        if args.command == "analyze":
-            result = analyze_snapshot(args.snapshot_id)
-            print(json.dumps(result, indent=2))
-            return
+        if args.command == "serve":
+            import uvicorn
 
-        if args.command == "ingest":
-            if args.source.startswith("https://"):
-                result = ingest_github_repository(args.source)
+            print(f"EvidenceLoop is running on http://{args.host}:{args.port}")
+            uvicorn.run("api.main:app", host=args.host, port=args.port)
+
+        elif args.command == "analyze":
+            source = args.source
+            if get_snapshot(source) is not None:
+                snapshot_id = source
+            elif source.endswith(".zip"):
+                snapshot_id = ingest_zip_file(Path(source))["snapshot_id"]
             else:
-                result = ingest_zip_file(Path(args.source))
+                url = source if source.startswith("http") else f"https://github.com/{source}"
+                snapshot_id = ingest_github_repository(url)["snapshot_id"]
 
-            print(json.dumps(result, indent=2))
+            def progress(stage: str, done: int, total: int, message: str) -> None:
+                if total and stage in {"parse", "measure"}:
+                    print(f"\r{stage}: {done}/{total}", end="", file=sys.stderr)
+
+            result = run_full_analysis(snapshot_id, progress)
+            print(file=sys.stderr)
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                print(f"Snapshot: {snapshot_id}\n")
+                _print_report(result)
+
+        elif args.command == "report":
+            found = load_report(args.snapshot_id) or run_full_analysis(args.snapshot_id)
+            print(json.dumps(found, indent=2) if args.json else "", end="")
+            if not args.json:
+                _print_report(found)
+
+        elif args.command == "list":
+            for row in list_snapshots():
+                found = load_report(row["snapshot_id"])
+                headline = found["summary"]["headline"] if found else "(not analysed yet)"
+                print(f"{row['snapshot_id']}\n    {headline}")
 
         elif args.command == "coverage":
             rows = get_coverage(args.snapshot_id)
-
             for row in rows:
-                print(
-                    f"{row['status']:10} "
-                    f"{row['relative_path']} "
-                    f"{row['skip_reason'] or ''}"
-                )
-
+                print(f"{row['status']:10} {row['relative_path']} {row['skip_reason'] or ''}")
             print(f"\nTotal files: {len(rows)}")
 
-        elif args.command == "snapshot":
-            snapshot = get_snapshot(args.snapshot_id)
-
-            if snapshot is None:
-                print("Snapshot not found.")
-            else:
-                print(json.dumps(dict(snapshot), indent=2))
-
     except IngestionError as exc:
-        parser.exit(1, f"Ingestion error: {exc}\n")
-    except AnalysisError as exc:
-        parser.exit(1, f"Analysis error: {exc}\n")
+        parser.exit(1, f"Could not ingest: {exc}\n")
+    except (AnalysisError, ReportError) as exc:
+        parser.exit(1, f"Could not analyse: {exc}\n")
 
 
 if __name__ == "__main__":

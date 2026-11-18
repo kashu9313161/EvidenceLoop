@@ -15,7 +15,8 @@ from pathlib import Path, PurePosixPath
 from analysis.javascript import shallow
 from analysis.models import AnalysisFailure, FileFacts
 from analysis.python import extractor as python_extractor
-from storage.database import get_connection, get_snapshot, initialize_database
+from core.textio import decode_text
+from storage.database import get_connection, get_snapshot, initialize_database, snapshot_root
 
 ANALYZER_VERSION = "m2.1"
 PYTHON_EXTENSIONS = {".py", ".pyi"}
@@ -75,11 +76,12 @@ def analyze_file(root: Path, relative_path: str) -> FileResult:
             result.stages.append((stage, "failed", exc.reason))
         return result
 
-    # Full-text stage: any eligible text file.
-    if b"\x00" in data:
+    # Full-text stage: any eligible text file (UTF-8, or UTF-16 with a byte-order mark).
+    text = decode_text(data)
+    if text is None:
         result.stages.append((STAGE_FTS, "failed", "Binary content"))
     else:
-        result.text = data.decode("utf-8", errors="replace")
+        result.text = text
         result.stages.append((STAGE_FTS, "analyzed", None))
 
     if code_stage is None:
@@ -202,8 +204,8 @@ def analyze_snapshot(snapshot_id: str, progress: ProgressCallback | None = None)
     if snapshot is None:
         raise AnalysisError(f"Unknown snapshot: {snapshot_id}")
 
-    root = Path(snapshot["root_path"]).resolve()
-    if not root.is_dir():
+    root = snapshot_root(snapshot)
+    if root is None:
         raise AnalysisError("The snapshot's files are missing on disk. Ingest it again.")
 
     with get_connection() as connection:

@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-EvidenceLoop V1 is a local-first, evidence-grounded codebase intelligence tool. **Ingestion** (Milestone 1.5) and the
-**Streamlit app shell** are implemented. The app (`app/streamlit_app.py` with pages in `app/app_pages/`) is wired to
-ingestion and shows the snapshot overview and the coverage ledger. The other pages are labelled placeholders.
-`analysis/` (python/javascript/typescript/graph/scanners/coverage), `retrieval/`, `verification/`, `evaluation/`,
-`findings/`, `intelligence/` (providers/evaluators) and `obsidian/` are empty package placeholders. The FastAPI app
-(`api/main.py`) exposes only `/` and `/health`. The build order and acceptance criteria for everything else are in
-`docs/IMPLEMENTATION_PLAN.md`, and the product explanation is in `docs/PROJECT_GUIDE.md`.
+EvidenceLoop V2 is a local web app: `web/` (React + Vite) talks to `api/main.py` (FastAPI), which serves the built
+app from `web/dist`. The flow is ingestion → per-file parse (`analysis/pipeline.py`) → report
+(`analysis/understanding/report.py`, stored in `analysis_reports` plus `graph_nodes`/`graph_edges`). The Streamlit
+app was removed in V2. What's next is in `docs/IMPLEMENTATION_PLAN.md`; how it works is in `docs/PROJECT_GUIDE.md`.
+
+When the report's shape changes, bump `REPORT_VERSION` in `report.py` so stored reports are rebuilt, and keep
+`web/src/api.ts` types in step with it.
 
 ## Commands
 
@@ -23,12 +23,14 @@ ruff check .                                   # lint (CI runs this; line length
 pytest -q                                      # all tests (offline)
 pytest tests/test_ingestion.py::test_reject_path_traversal -q   # single test
 
-python -m cli.main ingest https://github.com/owner/repo   # or a local .zip path
-python -m cli.main coverage "<snapshot_id>"               # per-file pending/skipped status
-python -m cli.main snapshot "<snapshot_id>"               # snapshot row as JSON
+python -m cli.main serve                                  # web app on http://localhost:8000
+python -m cli.main analyze https://github.com/owner/repo  # or owner/repo, or a local .zip
+python -m cli.main report "<snapshot_id>"                 # headline, areas, issues as text
+python -m cli.main coverage "<snapshot_id>"
 
-uvicorn api.main:app --port 8000
-streamlit run app/streamlit_app.py
+uvicorn api.main:app --reload --port 8000                 # API with reload
+cd web && npm install && npm run dev                      # UI with hot reload on :5173
+cd web && npm run build                                   # what `serve` hosts
 ```
 
 CI (`.github/workflows/ci.yml`) runs `ruff check .` and `pytest -q` on Ubuntu **and Windows**, Python 3.11 and 3.12, so
@@ -36,8 +38,10 @@ path handling must work on both.
 
 ## Architecture
 
-**Flow:** `cli/main.py` → `ingestion/service.py` → `storage/database.py` (SQLite at `data/evidenceloop.db`), with
-extracted files under `data/repositories/`. All limits, supported extensions and ignored names live in `core/config.py`.
+**Flow:** `api/main.py` or `cli/main.py` → `ingestion/service.py` → `analysis/pipeline.py` →
+`analysis/understanding/report.py` → `storage/database.py` (SQLite at `data/evidenceloop.db`), with extracted files
+under `data/repositories/`. Snapshot roots are resolved with `storage.database.snapshot_root`, which survives a moved
+project folder. All limits, supported extensions and ignored names live in `core/config.py`.
 
 **Ingestion (`ingestion/service.py`)** treats every repository as untrusted input. Nothing is executed:
 - GitHub: resolve the default branch to a commit SHA through the GitHub API, then stream that zipball, aborting past

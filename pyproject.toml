@@ -1,19 +1,29 @@
 [project]
 name = "evidenceloop"
-version = "0.1.0"
-description = "Evidence-grounded codebase intelligence (local-first)."
+version = "2.0.0"
+description = "Understand a codebase before you change it: a map, a plain-English overview and evidence-backed issues."
 requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.27",
   "fastapi>=0.110",
   "uvicorn>=0.29",
-  "streamlit>=1.35",
   "pydantic>=2.6",
-  "typer>=0.12",
+  "networkx>=3.2",
+  "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+evidenceloop = "cli.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["analysis*", "api*", "cli*", "core*", "ingestion*", "storage*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -24,7 +34,7 @@ norecursedirs = ["data", ".venv", ".git"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["data"]
+extend-exclude = ["data", "web"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
