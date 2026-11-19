@@ -455,3 +455,46 @@ def test_an_empty_handler_that_leaves_a_checked_fallback_is_not_swallowing():
     assert [s.rule for s in analyze_python(fallback).smells] == []
     assert [s.rule for s in analyze_python(swallowed).smells] == ["swallowed_exception"]
     assert [s.rule for s in analyze_python(unused).smells] == ["swallowed_exception"]
+
+
+# --------------------------------------------------------------------------- scale
+
+
+def _tree(tmp_path, count: int):
+    for i in range(count):
+        package = tmp_path / f"pkg{i % 7}"
+        package.mkdir(exist_ok=True)
+        (package / f"m{i}.py").write_text(f"import os\n\ndef f{i}(x):\n    return x + {i}\n",
+                                          encoding="utf-8")
+    return sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*.py"))
+
+
+def test_parallel_parsing_gives_the_same_results_as_serial(tmp_path, monkeypatch):
+    from analysis import pipeline
+
+    paths = _tree(tmp_path, 30)
+    monkeypatch.setattr(pipeline, "PARALLEL_MIN_FILES", 10)
+    seen = []
+    parallel = pipeline.analyze_files(tmp_path, paths, lambda i, n, p: seen.append(i), workers=2)
+    serial = pipeline.analyze_files(tmp_path, paths, workers=1)
+    assert [r.relative_path for r in parallel] == paths
+    assert [(r.relative_path, r.status, r.stages, r.facts.symbols[0].name, r.indexable)
+            for r in parallel] == \
+        [(r.relative_path, r.status, r.stages, r.facts.symbols[0].name, r.indexable)
+         for r in serial]
+    assert seen == list(range(1, 31))
+
+
+def test_a_broken_pool_falls_back_to_serial(tmp_path, monkeypatch):
+    from analysis import pipeline
+
+    paths = _tree(tmp_path, 12)
+    monkeypatch.setattr(pipeline, "PARALLEL_MIN_FILES", 5)
+
+    class Broken:
+        def __init__(self, *a, **k):
+            raise OSError("no subprocesses here")
+
+    monkeypatch.setattr(pipeline, "ProcessPoolExecutor", Broken)
+    results = pipeline.analyze_files(tmp_path, paths, workers=4)
+    assert [r.status for r in results] == ["analyzed"] * 12

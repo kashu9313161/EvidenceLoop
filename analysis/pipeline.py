@@ -3,13 +3,20 @@
 `analyze_snapshot` is idempotent: it reads every eligible file, then deletes that snapshot's
 analysis rows and rewrites them in one transaction, so a rerun never duplicates anything and
 a crash mid-way leaves the previous results intact.
+
+Big snapshots are parsed in a process pool (results kept in path order, so the output is the
+same as a serial run; any pool failure falls back to serial). File text isn't held for the
+whole run: the full-text index reads each file again, one at a time, while it writes.
 """
 
 import json
+import os
 import time
 from collections import Counter
 from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path, PurePosixPath
 
 from analysis.javascript import shallow
@@ -27,6 +34,10 @@ STAGE_FTS = "fts"
 
 ProgressCallback = Callable[[int, int, str], None]
 
+# Below this many files a pool costs more to start than it saves.
+PARALLEL_MIN_FILES = 200
+MAX_WORKERS = 8
+
 
 class AnalysisError(Exception):
     """The snapshot as a whole cannot be analyzed (e.g. unknown ID, files missing)."""
@@ -39,7 +50,8 @@ class FileResult:
     reason: str | None = None
     stages: list[tuple[str, str, str | None]] = field(default_factory=list)
     facts: FileFacts | None = None
-    text: str | None = None
+    # Decodes as text, so it goes in the full-text index (read again when written).
+    indexable: bool = False
 
 
 def code_stage_for(relative_path: str) -> str | None:
@@ -77,15 +89,14 @@ def analyze_file(root: Path, relative_path: str) -> FileResult:
         return result
 
     # Full-text stage: any eligible text file (UTF-8, or UTF-16 with a byte-order mark).
-    text = decode_text(data)
-    if text is None:
+    if decode_text(data) is None:
         result.stages.append((STAGE_FTS, "failed", "Binary content"))
     else:
-        result.text = text
+        result.indexable = True
         result.stages.append((STAGE_FTS, "analyzed", None))
 
     if code_stage is None:
-        if result.text is None:
+        if not result.indexable:
             result.status, result.reason = "failed", "Binary content"
         return result
 
@@ -105,6 +116,42 @@ def analyze_file(root: Path, relative_path: str) -> FileResult:
     return result
 
 
+def _serial(root: Path, paths: list[str], progress: ProgressCallback | None) -> list[FileResult]:
+    results = []
+    for index, path in enumerate(paths, start=1):
+        results.append(analyze_file(root, path))
+        if progress is not None:
+            progress(index, len(paths), path)
+    return results
+
+
+def _parallel(root: Path, paths: list[str], progress: ProgressCallback | None,
+              workers: int) -> list[FileResult]:
+    results = []
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        # map() yields in input order, so results match a serial run exactly.
+        chunk = max(1, min(64, len(paths) // (workers * 4)))
+        for index, result in enumerate(pool.map(partial(analyze_file, root), paths,
+                                                chunksize=chunk), start=1):
+            results.append(result)
+            if progress is not None:
+                progress(index, len(paths), result.relative_path)
+    return results
+
+
+def analyze_files(root: Path, paths: list[str], progress: ProgressCallback | None = None,
+                  workers: int | None = None) -> list[FileResult]:
+    """Analyse each path; in a process pool when there are many, serially otherwise or if the
+    pool can't start or breaks (a sandbox without subprocesses, a crashed worker)."""
+    workers = workers or min(MAX_WORKERS, max(1, (os.cpu_count() or 2) - 1))
+    if workers > 1 and len(paths) >= PARALLEL_MIN_FILES:
+        try:
+            return _parallel(root, paths, progress, workers)
+        except Exception:  # noqa: BLE001 - any pool failure: do it serially instead
+            pass
+    return _serial(root, paths, progress)
+
+
 def _symbol_rows(facts: FileFacts):
     """Yield (symbol_id, symbol). IDs are `path::qualified_name`, with `@line` on repeats
     (e.g. a property getter and setter share a name)."""
@@ -117,7 +164,14 @@ def _symbol_rows(facts: FileFacts):
         yield symbol_id, symbol
 
 
-def _write(snapshot_id: str, results: list[FileResult], summary: dict) -> None:
+def _text_of(root: Path, relative_path: str) -> str | None:
+    try:
+        return decode_text(_read_inside(root, relative_path))
+    except AnalysisFailure:
+        return None
+
+
+def _write(snapshot_id: str, root: Path, results: list[FileResult], summary: dict) -> None:
     with get_connection() as connection:
         for table in ("file_stages", "symbols", "imports", "calls", "files_fts", "symbols_fts"):
             connection.execute(f"DELETE FROM {table} WHERE snapshot_id = ?", (snapshot_id,))
@@ -137,10 +191,11 @@ def _write(snapshot_id: str, results: list[FileResult], summary: dict) -> None:
                  for stage, status, reason in result.stages],
             )
 
-            if result.text is not None:
+            text = _text_of(root, path) if result.indexable else None
+            if text is not None:
                 connection.execute(
                     "INSERT INTO files_fts (snapshot_id, relative_path, content) VALUES (?, ?, ?)",
-                    (snapshot_id, path, result.text),
+                    (snapshot_id, path, text),
                 )
 
             facts = result.facts
@@ -218,11 +273,7 @@ def analyze_snapshot(snapshot_id: str, progress: ProgressCallback | None = None)
             )
         ]
 
-    results: list[FileResult] = []
-    for index, path in enumerate(paths, start=1):
-        results.append(analyze_file(root, path))
-        if progress is not None:
-            progress(index, len(paths), path)
+    results = analyze_files(root, paths, progress)
 
     statuses = Counter(result.status for result in results)
     facts = [result.facts for result in results if result.facts is not None]
@@ -242,5 +293,5 @@ def analyze_snapshot(snapshot_id: str, progress: ProgressCallback | None = None)
         "seconds": round(time.perf_counter() - started, 2),
     }
 
-    _write(snapshot_id, results, summary)
+    _write(snapshot_id, root, results, summary)
     return {"snapshot_id": snapshot_id, "analyzer_version": ANALYZER_VERSION, **summary}
