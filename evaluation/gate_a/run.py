@@ -2,6 +2,7 @@
 
     python -m evaluation.gate_a.run                      # LLM judge, Jev 1.13 and Jev 1.14
     python -m evaluation.gate_a.run --evaluators jev-1.14.0 --limit 10
+    python -m evaluation.gate_a.run --cases eval/gate_a/cases.json   # the 40-case set
 
 Only cases with a human_label are used. Each evaluator judges every case's claim against its
 evidence. The report gives, per evaluator: accuracy at the current thresholds (EL_T_*), the
@@ -45,6 +46,19 @@ Factory = Callable[[Metered], Evaluator]
 
 
 def load_cases(path: Path) -> list[dict]:
+    """Labelled cases from candidates.yaml (`human_label`) or eval/gate_a/cases.json (`label`).
+    A cases.json set must pass eval.gate_a.verify_cases first, or nothing runs."""
+    if path.suffix == ".json":
+        from eval.gate_a import verify_cases
+
+        problems = verify_cases.problems(path)
+        if problems:
+            raise SystemExit(f"{path} failed verification, so it won't be scored:\n  "
+                             + "\n  ".join(problems)
+                             + "\nRun `python -m eval.gate_a.verify_cases` for details.")
+        cases = json.loads(path.read_text(encoding="utf-8"))["cases"]
+        return [{**c, "human_label": c["label"]} for c in cases
+                if c.get("label") in metrics.LABELS]
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     return [c for c in data["cases"] if c.get("human_label") in metrics.LABELS]
 

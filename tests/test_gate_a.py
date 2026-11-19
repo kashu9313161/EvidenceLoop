@@ -165,3 +165,82 @@ def test_the_real_candidates_file_loads():
     cases = yaml.safe_load(run.DEFAULT_CASES.read_text(encoding="utf-8"))["cases"]
     assert len(cases) == 60
     assert all(c["evidence"]["text"] for c in cases)
+
+
+# --- eval/gate_a: the 40-case ground-truth set -------------------------------------------------
+
+def _case_set(tmp_path, label=None, text="def f():\n    return 1"):
+    """A one-snapshot tree plus a cases.json with the plan's bucket counts."""
+    from eval.gate_a.build_cases import TARGET
+
+    root = tmp_path / "snap"
+    (root / "pkg").mkdir(parents=True)
+    (root / "pkg" / "m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    cases = []
+    for kind, n in TARGET.items():
+        for _ in range(n):
+            cases.append({"id": f"ga-{len(cases) + 1:02d}", "repo": "o/r", "snapshot": "s",
+                          "claim": "f returns 1.",
+                          "evidence": {"path": "pkg/m.py", "start": 1, "end": 2, "text": text},
+                          "constructed_as": kind, "construction_note": "", "label": None,
+                          "labeller_note": ""})
+    cases[0]["label"] = label
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps({"cases": cases}), encoding="utf-8")
+    return path, {"s": root}
+
+
+def test_verify_accepts_a_matching_set_and_counts_progress(tmp_path):
+    from eval.gate_a import verify_cases
+
+    path, roots = _case_set(tmp_path, label="not_supported")
+    report = verify_cases.check(path, roots)
+    assert report.problems == []
+    assert report.labelled == 1
+    assert len(report.disagreements) == 1  # ga-01 was constructed as "supports"
+
+
+def test_verify_catches_stale_text_and_misspelt_labels(tmp_path):
+    from eval.gate_a import verify_cases
+
+    path, roots = _case_set(tmp_path, label="supported", text="def f():\n    return 2")
+    problems = verify_cases.problems(path, roots)
+    assert any("no longer matches" in p for p in problems)
+    assert any("'supported' is not one of" in p for p in problems)
+    assert verify_cases.main([str(tmp_path / "missing.json")]) == 1
+
+
+def test_verify_catches_wrong_bucket_counts(tmp_path):
+    from eval.gate_a import verify_cases
+
+    path, roots = _case_set(tmp_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["cases"][-1]["constructed_as"] = "supports"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert any("Bucket counts" in p for p in verify_cases.problems(path, roots))
+
+
+def test_the_runner_reads_cases_json_and_refuses_a_broken_set(tmp_path, monkeypatch):
+    from eval.gate_a import verify_cases
+
+    path, _ = _case_set(tmp_path, label="supports")
+    monkeypatch.setattr(verify_cases, "problems", lambda p: [])
+    cases = run.load_cases(path)
+    assert [c["human_label"] for c in cases] == ["supports"]
+
+    monkeypatch.setattr(verify_cases, "problems", lambda p: ["ga-01: stale"])
+    with pytest.raises(SystemExit, match="failed verification"):
+        run.load_cases(path)
+
+
+def test_the_real_cases_file_has_the_plan_mix():
+    from eval.gate_a.build_cases import CASES_PATH, TARGET
+
+    cases = json.loads(CASES_PATH.read_text(encoding="utf-8"))["cases"]
+    kinds = {k: sum(c["constructed_as"] == k for c in cases) for k in TARGET}
+    assert kinds == TARGET
+    assert len({c["id"] for c in cases}) == 40
+    spans = [(c["snapshot"], c["evidence"]["path"], c["evidence"]["start"], c["evidence"]["end"])
+             for c in cases]
+    assert len(set(spans)) == 40
+    assert all(c["label"] in (None, *metrics.LABELS) for c in cases)
