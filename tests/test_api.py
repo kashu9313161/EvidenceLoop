@@ -19,7 +19,7 @@ def client(isolated_storage):
 def wait_for(client, job_id: str) -> dict:
     for _ in range(200):
         job = client.get(f"/api/jobs/{job_id}").json()
-        if job["stage"] in {"done", "error"}:
+        if job["stage"] in {"done", "error", "needs_scope"}:
             return job
         time.sleep(0.02)
     raise AssertionError("job did not finish")
@@ -91,7 +91,7 @@ def test_a_bad_address_fails_with_a_message(client):
 def test_a_link_inside_a_repository_is_named_by_owner_and_repo(client, monkeypatch):
     seen = []
     monkeypatch.setattr(api_main, "ingest_github_repository",
-                        lambda url: seen.append(url) or (_ for _ in ()).throw(
+                        lambda url, **_: seen.append(url) or (_ for _ in ()).throw(
                             api_main.IngestionError("offline")))
     job = client.post("/api/analyze",
                       json={"url": "github.com/pallets/flask/tree/main/src/flask"}).json()
@@ -203,3 +203,57 @@ def test_an_outdated_report_is_rebuilt_in_the_background(client):
     assert wait_for(client, job["id"])["stage"] == "done"
     ready = client.get("/api/report", params={"snapshot": snapshot_id, "background": 1})
     assert ready.status_code == 200 and ready.json()["summary"]["headline"]
+
+
+# --------------------------------------------------------------------------- big repositories
+
+
+def test_a_repository_over_the_limits_ends_with_a_plan_to_pick_from(client, monkeypatch):
+    from ingestion.preflight import Entry, NeedsScope, build_plan
+
+    plan = build_plan([Entry("app/a.py", 10), Entry("lib/b.py", 10), Entry("data.csv", 10**9)],
+                      max_files=1)
+    scopes = []
+
+    def needs_scope(url, scope=None, on_plan=None):
+        scopes.append(scope)
+        if scope is None:
+            raise NeedsScope(plan)
+        raise api_main.IngestionError("offline")
+
+    monkeypatch.setattr(api_main, "ingest_github_repository", needs_scope)
+    job = wait_for(client, client.post("/api/analyze", json={"url": "o/r"}).json()["id"])
+    assert job["stage"] == "needs_scope" and job["error"] is None
+    assert {f["folder"] for f in job["plan"]["folders"]} == {"app", "lib"}
+    assert "Archive exceeded" not in job["message"]
+    assert api_main._running_jobs() == 0  # waiting for a choice doesn't hold a slot
+
+    wait_for(client, client.post("/api/analyze", json={"url": "o/r", "scope": "app"}).json()["id"])
+    assert scopes == [None, "app"]
+
+
+def test_a_folder_upload_is_analysed_and_bad_paths_are_refused(client):
+    def send(paths: dict[str, bytes]):
+        data, files = [], []
+        for path, content in paths.items():
+            files.append(("path", (None, path)))
+            files.append(("file", ("blob", content, "application/octet-stream")))
+        return client.post("/api/analyze/folder", files=files + data)
+
+    good = send({f"shop/{p}": c.encode() if isinstance(c, str) else c for p, c in SAMPLE.items()})
+    assert good.status_code == 200
+    job = wait_for(client, good.json()["id"])
+    assert job["stage"] == "done", job["error"]
+    assert job["snapshot_id"].startswith("folder-")
+
+    bad = wait_for(client, send({"shop/../../evil.py": b"x", "shop/ok.py": b"1"}).json()["id"])
+    assert bad["stage"] == "error" and "Unsafe" in bad["error"]
+    assert client.post("/api/analyze/folder", files=[("path", (None, "a.py"))]).status_code == 422
+
+
+def test_the_config_ships_the_rules_to_the_browser(client):
+    data = client.get("/api/config").json()
+    assert ".py" in data["rules"]["supported_extensions"]
+    assert "venv" in data["rules"]["ignored_directories"]["Virtual environment"]
+    assert ".csv" in data["rules"]["skipped_extensions"]["Dataset"]
+    assert data["limits"]["source_files"] > 0 and data["limits"]["upload_bytes"] >= 10**9

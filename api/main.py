@@ -10,6 +10,8 @@ import base64
 import hashlib
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -29,11 +31,15 @@ from analysis.pipeline import AnalysisError
 from analysis.understanding import explain
 from analysis.understanding.explain import ExplainError
 from analysis.understanding.report import ReportError, load_report, run_full_analysis
+from core import config
 from core.textio import decode_text
+from ingestion.rules import source_rules
 from ingestion.service import (
     IngestionError,
+    NeedsScope,
+    ingest_folder,
     ingest_github_repository,
-    ingest_zip_bytes,
+    ingest_zip_path,
     parse_github_url,
 )
 from intelligence.ask import AskError, answer_lookup, load_asks
@@ -54,7 +60,8 @@ from storage.database import (
 
 WEB_DIST = Path(__file__).resolve().parents[1] / "web" / "dist"
 MAX_FILE_BYTES = 2 * 1024 * 1024
-MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_UPLOAD_BYTES = config.MAX_UPLOAD_BYTES  # a ZIP or a folder, streamed to a temp file
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 UNKNOWN_REPOSITORY = ("This repository isn't in EvidenceLoop any more. "
                       "Analyse it again from the home page.")
 
@@ -102,6 +109,8 @@ OWN_FETCH_SITES = {"same-origin", "none"}
 
 MAX_BODY_BYTES = 1024 * 1024  # JSON requests are a few hundred bytes; uploads have their own cap
 UPLOAD_PATH = "/api/analyze/upload"
+FOLDER_UPLOAD_PATH = "/api/analyze/folder"
+UPLOAD_PATHS = {UPLOAD_PATH, FOLDER_UPLOAD_PATH}
 
 
 def _inline_script_hashes(index: Path) -> list[str]:
@@ -143,9 +152,9 @@ SECURITY_HEADERS = {
 async def security_headers(request: Request, call_next):
     """Every response, refusals included: no framing by other sites, a content security
     policy, no content-type sniffing and no referrer. Bodies larger than any real request are
-    refused before they are read (the upload route allows a 100 MB ZIP)."""
+    refused before they are read (the upload routes allow MAX_UPLOAD_BYTES)."""
     length = request.headers.get("content-length", "")
-    limit = MAX_UPLOAD_BYTES + MAX_BODY_BYTES if request.url.path == UPLOAD_PATH \
+    limit = MAX_UPLOAD_BYTES + MAX_BODY_BYTES if request.url.path in UPLOAD_PATHS \
         else MAX_BODY_BYTES
     if length.isdigit() and int(length) > limit:
         response = JSONResponse({"detail": "The request is too large."}, status_code=413)
@@ -201,7 +210,9 @@ STAGE_LABELS = {
     "insights": "Looking for problems",
     "done": "Ready",
     "error": "Failed",
+    "needs_scope": "Choose what to analyse",
 }
+FINISHED_STAGES = {"done", "error", "needs_scope"}
 
 
 @dataclass
@@ -215,6 +226,9 @@ class Job:
     message: str = ""
     snapshot_id: str | None = None
     error: str | None = None
+    # What the preflight found (sizes, skipped files by reason, folders); for needs_scope, the
+    # folders to pick from.
+    plan: dict | None = None
     started: float = field(default_factory=time.time)
     finished: float | None = None
 
@@ -233,8 +247,8 @@ def _update(job: Job, **changes) -> None:
 
 def _run(job: Job, ingest) -> None:
     try:
-        _update(job, stage="fetch", message="Downloading and validating every file")
-        result = ingest()
+        _update(job, stage="fetch", message="Listing the repository and choosing what to read")
+        result = ingest(lambda plan: _update(job, plan=plan, message="Fetching the source files"))
         _update(job, snapshot_id=result["snapshot_id"])
         unchanged = result.get("already_downloaded") and not result.get("reanalyze")
         if unchanged and load_report(result["snapshot_id"]) is not None:
@@ -248,6 +262,9 @@ def _run(job: Job, ingest) -> None:
         run_full_analysis(result["snapshot_id"], progress)
         _update(job, stage="done", message="Analysis complete", finished=time.time())
         _pregenerate_explanations(result["snapshot_id"])
+    except NeedsScope as exc:
+        _update(job, stage="needs_scope", plan=exc.plan.to_dict(), message=str(exc),
+                finished=time.time())
     except (IngestionError, AnalysisError, ReportError) as exc:
         _update(job, stage="error", error=str(exc), finished=time.time())
     except Exception as exc:  # pragma: no cover - surfaced to the UI instead of a dead job
@@ -270,7 +287,7 @@ FINISHED_JOB_TTL = 3600  # seconds a finished job's status stays available
 
 def _running_jobs() -> int:
     with _lock:
-        return sum(1 for j in _jobs.values() if j.stage not in {"done", "error"})
+        return sum(1 for j in _jobs.values() if j.stage not in FINISHED_STAGES)
 
 
 def _check_capacity() -> None:
@@ -296,6 +313,9 @@ def _start(source: str, ingest, snapshot_id: str | None = None) -> Job:
 class AnalyzeRequest(BaseModel):
     url: str | None = None
     snapshot_id: str | None = None
+    # A folder of the repository to analyse, or "*": over the limits, take the most important
+    # files. Sent after a job ended with "needs_scope".
+    scope: str | None = None
 
 
 @app.post("/api/analyze")
@@ -305,7 +325,8 @@ def analyze(request: AnalyzeRequest) -> dict:
             raise HTTPException(404, UNKNOWN_REPOSITORY)
         snapshot_id = request.snapshot_id
         # An explicit re-run: analyse again even though a report exists.
-        job = _start(snapshot_id, lambda: {"snapshot_id": snapshot_id, "reanalyze": True})
+        job = _start(snapshot_id,
+                     lambda _plan: {"snapshot_id": snapshot_id, "reanalyze": True})
     elif request.url and request.url.strip():
         url = request.url.strip()
         if not url.startswith("http"):
@@ -315,21 +336,109 @@ def analyze(request: AnalyzeRequest) -> dict:
             url = f"https://github.com/{owner}/{name}"  # what the progress box names
         except IngestionError:
             pass  # the job reports the error, so the page shows one message either way
-        job = _start(url, lambda: ingest_github_repository(url))
+        scope = request.scope
+        job = _start(url, lambda on_plan: ingest_github_repository(url, scope=scope,
+                                                                   on_plan=on_plan))
     else:
         raise HTTPException(422, "Give a GitHub URL (or owner/repo) to analyze.")
     return asdict(job)
 
 
+def _upload_dir() -> Path:
+    folder = config.TEMP_DIR / "uploads"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _too_large() -> HTTPException:
+    limit = MAX_UPLOAD_BYTES // (1024 * 1024)
+    return HTTPException(413, f"The upload is larger than {limit:,} MB.")
+
+
 @app.post("/api/analyze/upload")
 async def analyze_upload(file: Annotated[UploadFile, File()]) -> dict:
-    _check_capacity()  # before reading up to 100 MB into memory
-    data = await file.read(MAX_UPLOAD_BYTES + 1)
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, "The ZIP is larger than 100 MB.")
+    """A ZIP, streamed to a temp file (never held in memory); only eligible entries are
+    extracted."""
+    _check_capacity()  # before reading the upload
     name = PurePosixPath(file.filename or "upload.zip").stem or "upload"
-    job = _start(file.filename or "upload.zip", lambda: ingest_zip_bytes(data, name))
+    handle, temp_name = tempfile.mkstemp(suffix=".zip", dir=_upload_dir())
+    received = 0
+    try:
+        with os.fdopen(handle, "wb") as out:
+            while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+                received += len(chunk)
+                if received > MAX_UPLOAD_BYTES:
+                    raise _too_large()
+                out.write(chunk)
+    except BaseException:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
+
+    def ingest(_plan):
+        try:
+            return ingest_zip_path(Path(temp_name), name)
+        finally:
+            Path(temp_name).unlink(missing_ok=True)
+
+    job = _start(file.filename or "upload.zip", ingest)
     return asdict(job)
+
+
+@app.post(FOLDER_UPLOAD_PATH)
+async def analyze_folder(request: Request) -> dict:
+    """A folder from the browser: `path` fields (relative paths) each followed by its `file`.
+    The browser already left out what isn't analysed; the server checks every path and file
+    again with the same rules before writing anything."""
+    _check_capacity()
+    form = await request.form(max_files=config.HARD_MAX_SOURCE_FILES,
+                              max_fields=config.HARD_MAX_SOURCE_FILES + 10)
+    paths = [str(p) for p in form.getlist("path")]
+    uploads = [f for f in form.getlist("file") if hasattr(f, "file")]
+    if not uploads or len(paths) != len(uploads):
+        await form.close()
+        raise HTTPException(422, "Send each file with its relative path.")
+    total = sum(getattr(f, "size", 0) or 0 for f in uploads)
+    if total > MAX_UPLOAD_BYTES:
+        await form.close()
+        raise _too_large()
+    name = str(form.get("name") or "").strip()[:100]
+    # Copy the parts out of the request (Starlette closes them when the request ends).
+    workdir = Path(tempfile.mkdtemp(dir=_upload_dir()))
+    files = []
+    try:
+        for index, upload in enumerate(uploads):
+            target = workdir / str(index)
+            with target.open("wb") as out:
+                shutil.copyfileobj(upload.file, out, UPLOAD_CHUNK_BYTES)
+            files.append((paths[index], target))
+    except BaseException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+    finally:
+        await form.close()
+
+    def ingest(_plan):
+        handles = [(path, target.open("rb")) for path, target in files]
+        try:
+            return ingest_folder(handles, name)
+        finally:
+            for _, handle in handles:
+                handle.close()
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    job = _start(name or "folder", ingest)
+    return asdict(job)
+
+
+@app.get("/api/config")
+def ingest_config() -> dict:
+    """The rules for what is analysed (so a folder upload is filtered in the browser the same
+    way) and the limits."""
+    return {
+        "rules": source_rules(),
+        "limits": {"source_files": config.MAX_SOURCE_FILES, "source_bytes": config.MAX_SOURCE_BYTES,
+                   "upload_bytes": MAX_UPLOAD_BYTES},
+    }
 
 
 @app.get("/api/jobs/{job_id}")
@@ -359,6 +468,7 @@ def repos() -> list[dict]:
             "source": row["source_type"], "url": row["source_url"],
             "commit": row["commit_sha"], "created_at": row["created_at"],
             "files": row["total_files"], "analyzed": report is not None,
+            "scope": row["scope"],
         }
         if report is not None:
             summary = report["summary"]
@@ -422,10 +532,10 @@ def report(snapshot: str = Query(...), background: bool = False):
     if background:
         with _lock:
             job = next((j for j in _jobs.values() if j.snapshot_id == snapshot
-                        and j.stage not in {"done", "error"}), None)
+                        and j.stage not in FINISHED_STAGES), None)
         if job is None:
             job = _start(_repo_label(snapshot),
-                         lambda: {"snapshot_id": snapshot, "reanalyze": True},
+                         lambda _plan: {"snapshot_id": snapshot, "reanalyze": True},
                          snapshot_id=snapshot)
         return JSONResponse({"rebuilding": True, "job": asdict(job)}, status_code=202)
     try:

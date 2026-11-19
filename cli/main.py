@@ -15,7 +15,12 @@ from pathlib import Path
 
 from analysis.pipeline import AnalysisError
 from analysis.understanding.report import ReportError, load_report, run_full_analysis
-from ingestion.service import IngestionError, ingest_github_repository, ingest_zip_file
+from ingestion.service import (
+    IngestionError,
+    NeedsScope,
+    ingest_github_repository,
+    ingest_zip_file,
+)
 from storage.database import get_coverage, get_snapshot, list_snapshots
 
 
@@ -78,6 +83,9 @@ def main(argv: list[str] | None = None) -> None:
     analyze = commands.add_parser("analyze", help="Ingest and analyse a repository")
     analyze.add_argument("source", help="GitHub URL, owner/repo, a local .zip, or a snapshot id")
     analyze.add_argument("--json", action="store_true", help="Print the full report as JSON")
+    analyze.add_argument("--scope", default=None,
+                         help="A folder of a big repository to analyse, or '*' for its most "
+                              "important files")
 
     report = commands.add_parser("report", help="Print the analysis of a snapshot")
     report.add_argument("snapshot_id")
@@ -102,7 +110,7 @@ def main(argv: list[str] | None = None) -> None:
                 snapshot_id = ingest_zip_file(Path(source))["snapshot_id"]
             else:
                 url = source if source.startswith("http") else f"https://github.com/{source}"
-                snapshot_id = ingest_github_repository(url)["snapshot_id"]
+                snapshot_id = ingest_github_repository(url, scope=args.scope)["snapshot_id"]
 
             def progress(stage: str, done: int, total: int, message: str) -> None:
                 if total and stage in {"parse", "measure"}:
@@ -134,6 +142,11 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"{row['status']:10} {row['relative_path']} {row['skip_reason'] or ''}")
             print(f"\nTotal files: {len(rows)}")
 
+    except NeedsScope as exc:
+        folders = "\n".join(f"  {f['folder'] or '(top-level files)'}: {f['files']} files"
+                            for f in exc.plan.folders()[:20])
+        parser.exit(2, f"{exc}\n\nFolders:\n{folders}\n\nRun again with --scope <folder>, or "
+                       "--scope '*' to analyse the most important files.\n")
     except IngestionError as exc:
         parser.exit(1, f"Could not ingest: {exc}\n")
     except (AnalysisError, ReportError) as exc:
