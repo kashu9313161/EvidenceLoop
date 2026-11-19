@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { api, type Job, type RepoSummary, workspacePath } from '../api'
+import { api, type IngestPlan, type Job, type RepoSummary, type SourceRules, workspacePath } from '../api'
 import { Logo, ThemeToggle } from '../components/bits'
 import { Progress } from '../components/Progress'
+import { ScopePicker } from '../components/ScopePicker'
 import { jobOutcome } from '../jobOutcome'
+import { pickFolder } from '../sourceRules'
 import { plural } from '../util'
+
+// React's input props don't include the (non-standard, widely supported) folder picker flag.
+const FOLDER_PICKER = { webkitdirectory: '', directory: '' } as Record<string, string>
 
 export function Home() {
   const navigate = useNavigate()
@@ -13,7 +18,11 @@ export function Home() {
   const [error, setError] = useState<string | null>(null)
   const [dragging, setDragging] = useState(false)
   const [repos, setRepos] = useState<RepoSummary[] | null>(null)
+  // A repository with more source than one analysis takes: pick a folder or "most important".
+  const [choice, setChoice] = useState<{ plan: IngestPlan; source: string } | null>(null)
   const fileInput = useRef<HTMLInputElement | null>(null)
+  const folderInput = useRef<HTMLInputElement | null>(null)
+  const rules = useRef<SourceRules | null>(null)
 
   useEffect(() => {
     api.repos().then(setRepos).catch(() => setRepos([]))
@@ -24,6 +33,9 @@ export function Home() {
     const outcome = jobOutcome(next)
     if (outcome.kind === 'open') {
       navigate(workspacePath(outcome.snapshotId))
+    } else if (outcome.kind === 'scope') {
+      setChoice({ plan: outcome.plan, source: outcome.source })
+      setJob(null)
     } else if (outcome.kind === 'failed') {
       setError(outcome.message)
       setJob(null)
@@ -47,6 +59,7 @@ export function Home() {
 
   const start = async (run: () => Promise<Job>) => {
     setError(null)
+    setChoice(null)
     try {
       receive(await run())
     } catch (e) {
@@ -89,6 +102,24 @@ Its analysis, explanations and questions are deleted ` +
     start(() => api.upload(file))
   }
 
+  const takeFolder = async (list: FileList | null) => {
+    if (!list || list.length === 0) return
+    try {
+      rules.current ??= (await api.config()).rules
+    } catch (e) {
+      setError((e as Error).message)
+      return
+    }
+    const picked = pickFolder([...list], rules.current)
+    if (folderInput.current) folderInput.current.value = ''  // the same folder can be picked again
+    if (picked.keep.length === 0) {
+      setError(`${picked.name || 'That folder'} has no source code EvidenceLoop can read ` +
+        `(${plural(picked.skipped, 'file')} skipped: ${picked.reasons.map((r) => r.reason.toLowerCase()).join(', ')}).`)
+      return
+    }
+    start(() => api.uploadFolder(picked.keep, picked.name))
+  }
+
   return (
     <div className="home">
       <header className="home-bar">
@@ -105,6 +136,10 @@ Its analysis, explanations and questions are deleted ` +
 
         {job ? (
           <Progress job={job} />
+        ) : choice ? (
+          <ScopePicker plan={choice.plan} source={choice.source}
+            onPick={(scope) => start(() => api.analyzeUrl(choice.source, scope))}
+            onCancel={() => setChoice(null)} />
         ) : (
           <form
             className={`analyze ${dragging ? 'dragging' : ''}`}
@@ -128,9 +163,15 @@ Its analysis, explanations and questions are deleted ` +
               <span>
                 {dragging ? 'Drop the ZIP to analyse it' : 'Or drop a ZIP of any project here, or '}
                 {!dragging && (
-                  <button type="button" className="link-btn" onClick={() => fileInput.current?.click()}>
-                    choose a file
-                  </button>
+                  <>
+                    <button type="button" className="link-btn" onClick={() => fileInput.current?.click()}>
+                      choose a file
+                    </button>
+                    {', or '}
+                    <button type="button" className="link-btn" onClick={() => folderInput.current?.click()}>
+                      upload a folder
+                    </button>
+                  </>
                 )}
               </span>
               <span className="examples">
@@ -149,6 +190,9 @@ Its analysis, explanations and questions are deleted ` +
             </div>
             <input ref={fileInput} type="file" accept=".zip" hidden
               onChange={(e) => takeFile(e.target.files?.[0])} />
+            {/* Only source files are sent: datasets, models, venv and node_modules stay here. */}
+            <input ref={folderInput} type="file" hidden multiple {...FOLDER_PICKER}
+              aria-label="Upload a folder" onChange={(e) => takeFolder(e.target.files)} />
           </form>
         )}
         {error && <p className="form-error" role="alert">{error}</p>}
@@ -163,6 +207,9 @@ Its analysis, explanations and questions are deleted ` +
               <span className="name">
                 {repo.owner && <span className="owner">{repo.owner} / </span>}
                 {repo.name}
+                {repo.scope && (
+                  <span className="owner"> · {repo.scope === '*' ? 'most important files' : `${repo.scope}/`}</span>
+                )}
               </span>
               <span className="headline">
                 {repo.headline ?? 'Not analysed yet. Open it to run the analysis.'}

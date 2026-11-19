@@ -1,7 +1,7 @@
 import type { Job } from '../api'
 
 const STEPS = [
-  { stage: 'fetch', label: 'Fetch the repository and check every file' },
+  { stage: 'fetch', label: 'List the repository and fetch its source files' },
   { stage: 'parse', label: 'Read and parse the code' },
   { stage: 'graph', label: 'Map how the files connect' },
   { stage: 'insights', label: 'Look for problems' },
@@ -31,6 +31,7 @@ export function Progress({ job, title, note }: { job: Job; title?: string; note?
           )
         })}
       </ol>
+      {job.plan && current < 4 && <div className="detail plan-summary">{job.plan.summary}</div>}
       {job.message && current < 4 && <div className="detail">{job.message}</div>}
     </div>
   )

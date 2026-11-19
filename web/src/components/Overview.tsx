@@ -277,6 +277,9 @@ export function Overview({ report, onSelect, onOpenIssue, onTab }: Props) {
               {coverage.inferred_edges > 0 && ` and ${coverage.inferred_edges} inferred (best guess)`}.
               Nothing from the repository was run.
             </p>
+            {coverage.scope?.kind && (
+              <p className="scope-note" role="note">{coverage.scope.sentence}</p>
+            )}
             {(coverage.skipped_files.length > 0 || coverage.failed_files.length > 0) && (
               <details className="disclosure">
                 <summary>See which files were left out, and why</summary>

@@ -101,3 +101,16 @@ export function inlineCode(text: string): (string | { code: string })[] {
   })
   return out
 }
+
+/** 1536 -> "1.5 KB"; 1.45e9 -> "1.4 GB". */
+export function formatBytes(size: number): string {
+  const units = ['bytes', 'KB', 'MB', 'GB']
+  let value = size
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  if (unit === 0) return `${Math.round(value)} bytes`
+  return `${value.toFixed(1).replace(/\.0$/, '')} ${units[unit]}`
+}

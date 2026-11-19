@@ -29,3 +29,11 @@ test('a job in progress keeps polling', () => {
     assert.deepEqual(jobOutcome({ stage, snapshot_id: null, error: null }), { kind: 'running' })
   }
 })
+
+test('a repository over the limits asks which folder to analyse', () => {
+  const plan = { status: 'needs_scope', summary: 'big', folders: [] } as never
+  assert.deepEqual(
+    jobOutcome({ stage: 'needs_scope', snapshot_id: null, error: null, plan, source: 'https://github.com/a/b' }),
+    { kind: 'scope', plan, source: 'https://github.com/a/b' })
+  assert.equal(jobOutcome({ stage: 'needs_scope', snapshot_id: null, error: null }).kind, 'failed')
+})

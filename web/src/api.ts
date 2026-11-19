@@ -193,6 +193,9 @@ export interface Report {
     skipped_by_reason: { reason: string; files: number }[]
     skipped_files: { path: string; reason: string }[]
     failed_files: { path: string; reason: string }[]
+    /** How much of the source was analysed (a folder, or the most important files of a big
+     * repository); absent in reports older than 2.6. */
+    scope?: CoverageScope
     /** Text that isn't analysed code (READMEs, docs, config); absent in older reports. */
     indexed_files?: string[]
     imports: {
@@ -236,11 +239,55 @@ export interface RepoSummary {
   created_at: string
   files: number
   analyzed: boolean
+  /** A folder of a big repository, '*' for its most important files, or null for all of it. */
+  scope?: string | null
   headline?: string
   kind?: string
   languages?: { name: string; files: number; loc: number }[]
   totals?: Report['summary']['totals']
   stack?: string[]
+}
+
+export interface CoverageScope {
+  kind: 'folder' | 'priority' | null
+  folder: string | null
+  source_files: number
+  analysed_source_files: number
+  left_out_folders: { folder: string; files: number }[]
+  sentence: string
+}
+
+/** What the preflight found before anything was downloaded. */
+export interface IngestPlan {
+  status: 'ok' | 'needs_scope'
+  scope: string | null
+  summary: string
+  repo_bytes: number
+  total_files: number
+  source_files: number
+  source_bytes: number
+  selected_files: number
+  selected_bytes: number
+  skipped_by_reason: { reason: string; files: number; bytes: number }[]
+  /** One level below the scope; `top_level_files` marks the files directly in it. */
+  folders: { folder: string; files: number; bytes: number; top_level_files: boolean }[]
+  limits: { files: number; bytes: number }
+}
+
+export interface SourceRules {
+  supported_extensions: string[]
+  ignored_directories: Record<string, string[]>
+  vendor_directory: string
+  vendor_extensions: string[]
+  skipped_extensions: Record<string, string[]>
+  ignored_file_names: string[]
+  svg_skip_bytes: number
+  max_file_bytes: number
+}
+
+export interface IngestConfig {
+  rules: SourceRules
+  limits: { source_files: number; source_bytes: number; upload_bytes: number }
 }
 
 export interface Job {
@@ -253,6 +300,7 @@ export interface Job {
   message: string
   snapshot_id: string | null
   error: string | null
+  plan?: IngestPlan | null
 }
 
 export interface FileDetail {
@@ -486,11 +534,12 @@ export const api = {
     request<FileDetail>(`/api/file?snapshot=${q(snapshot)}&path=${q(path)}`),
   search: (snapshot: string, text: string) =>
     request<SearchResult>(`/api/search?snapshot=${q(snapshot)}&q=${q(text)}`),
-  analyzeUrl: (url: string) =>
+  /** `scope`: a folder of a big repository, or '*' for its most important files. */
+  analyzeUrl: (url: string, scope?: string) =>
     request<Job>('/api/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify(scope ? { url, scope } : { url }),
     }),
   reanalyze: (snapshot_id: string) =>
     request<Job>('/api/analyze', {
@@ -503,6 +552,17 @@ export const api = {
     body.append('file', file)
     return request<Job>('/api/analyze/upload', { method: 'POST', body })
   },
+  /** A folder chosen in the browser: only the files that will be analysed, with their paths. */
+  uploadFolder: (files: { path: string; file: File }[], name: string) => {
+    const body = new FormData()
+    body.append('name', name)
+    for (const { path, file } of files) {
+      body.append('path', path)
+      body.append('file', file, 'blob')
+    }
+    return request<Job>('/api/analyze/folder', { method: 'POST', body })
+  },
+  config: () => request<IngestConfig>('/api/config'),
   job: (id: string) => request<Job>(`/api/jobs/${q(id)}`),
   /** Ask a question: lookups use no AI; open questions are answered with checked claims. */
   ask: (snapshot: string, question: string) =>
