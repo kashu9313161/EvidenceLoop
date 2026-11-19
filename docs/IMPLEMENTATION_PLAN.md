@@ -85,9 +85,11 @@ The original EvidenceLoop idea, now on solid ground: the graph and index already
 Done when a lookup answers with no LLM call, an analytical question returns verified claims with correct
 citations, and a fabricated citation is rejected.
 
-**Status (Nov 18): steps 2–5 built ahead of Gate A**, with the LLM judge as the only evaluator. Tested offline with
-fake models; not yet run against a real model. Thresholds are uncalibrated until Gate A. Still to do: Gate A
-(Jev behind the same `Evaluator` protocol, the labelled set, calibration) and tuning evidence ranking against it.
+**Status (Nov 19): steps 2–5 built; Gate A tooling built, not yet run.** `JevEvaluator` (typesafe-sdk, pinned
+version, small state, Retry-After retries) sits behind the same `Evaluator` protocol as the LLM judge, selectable with
+`EL_EVALUATOR=jev`. `evaluation/gate_a/run.py` scores the LLM judge, Jev 1.13 and Jev 1.14 against labelled cases.
+Waiting on: human labels for the 60 drafted cases and a TypeSafe key. Thresholds stay uncalibrated until then; see
+`docs/decisions/gate-a.md`. Still to do after Gate A: tuning evidence ranking against it.
 
 ### M4. Deeper facts (Dec 3 – Dec 12)
 

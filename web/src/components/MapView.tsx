@@ -62,6 +62,8 @@ export function MapView({ report, selected, onSelect, impactOn, highlight, onCle
   const [hover, setHover] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const [areaFocus, setAreaFocus] = useState<string | null>(null)
+  // On a phone the settings start folded, so the map gets the screen.
+  const [controlsOpen, setControlsOpen] = useState(() => typeof window === 'undefined' || window.innerWidth > 720)
 
   const colours = useMemo(() => areaPalette(report.architecture.areas, theme), [report, theme])
   const ink = useMemo(() => ({
@@ -312,7 +314,12 @@ export function MapView({ report, selected, onSelect, impactOn, highlight, onCle
 
   return (
     <div className="map" ref={wrap}>
-      <div className="map-controls" role="group" aria-label="Map controls">
+      <div className={`map-controls ${controlsOpen ? '' : 'folded'}`} role="group" aria-label="Map controls">
+        <button className="link-btn map-controls-toggle" onClick={() => setControlsOpen((v) => !v)}
+          aria-expanded={controlsOpen}>
+          {controlsOpen ? '▾' : '▸'} Map settings
+        </button>
+        {controlsOpen && (<>
         <input type="search" placeholder="Find a file on the map" value={query}
           onChange={(e) => setQuery(e.target.value)} aria-label="Find a file on the map"
           onKeyDown={(e) => {
@@ -354,6 +361,7 @@ export function MapView({ report, selected, onSelect, impactOn, highlight, onCle
             )}
           </>
         )}
+        </>)}
         {highlight && (
           <div className="map-cited">
             {view === 'files'

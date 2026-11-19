@@ -166,3 +166,40 @@ def test_an_unknown_repository_explains_what_to_do(client):
     response = client.get("/api/report", params={"snapshot": "github:nobody/nothing@abc"})
     assert response.status_code == 404
     assert "Analyse it again from the home page" in response.json()["detail"]
+
+
+def test_a_repository_can_be_removed(client):
+    snapshot_id = ingest_zip_bytes(make_zip(SAMPLE), "shop")["snapshot_id"]
+    client.get("/api/report", params={"snapshot": snapshot_id})
+    assert [r["snapshot_id"] for r in client.get("/api/repos").json()] == [snapshot_id]
+
+    foreign = client.post("/api/repos/remove", json={"snapshot": snapshot_id},
+                          headers={"Origin": "https://evil.example"})
+    assert foreign.status_code == 403  # another site can't delete your data
+
+    removed = client.post("/api/repos/remove", json={"snapshot": snapshot_id})
+    assert removed.status_code == 200 and removed.json() == {"removed": snapshot_id}
+    assert client.get("/api/repos").json() == []
+    assert client.post("/api/repos/remove", json={"snapshot": snapshot_id}).status_code == 404
+
+
+def test_a_repository_being_analysed_cannot_be_removed(client, monkeypatch):
+    snapshot_id = ingest_zip_bytes(make_zip(SAMPLE), "shop")["snapshot_id"]
+    job = api_main.Job(id="busy", source="x", stage="parse", snapshot_id=snapshot_id)
+    monkeypatch.setitem(api_main._jobs, "busy", job)
+    refused = client.post("/api/repos/remove", json={"snapshot": snapshot_id})
+    assert refused.status_code == 409 and "still being analysed" in refused.json()["detail"]
+
+
+def test_an_outdated_report_is_rebuilt_in_the_background(client):
+    snapshot_id = ingest_zip_bytes(make_zip(SAMPLE), "shop")["snapshot_id"]
+    first = client.get("/api/report", params={"snapshot": snapshot_id, "background": 1})
+    assert first.status_code == 202 and first.json()["rebuilding"] is True
+    job = first.json()["job"]
+    assert job["source"] == "shop" and job["snapshot_id"] == snapshot_id
+    again = client.get("/api/report", params={"snapshot": snapshot_id, "background": 1})
+    if again.status_code == 202:  # still running: the second request joins the same job
+        assert again.json()["job"]["id"] == job["id"]
+    assert wait_for(client, job["id"])["stage"] == "done"
+    ready = client.get("/api/report", params={"snapshot": snapshot_id, "background": 1})
+    assert ready.status_code == 200 and ready.json()["summary"]["headline"]

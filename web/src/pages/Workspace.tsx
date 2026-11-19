@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { type AiStatus, api, type Report, workspacePath } from '../api'
+import { type AiStatus, api, type Job, type Report, workspacePath } from '../api'
 import { exampleQuestions } from '../askView'
 import { Logo, ThemeToggle } from '../components/bits'
 import { ChatButton, type ChatMessage, ChatPanel } from '../components/Chat'
@@ -10,6 +10,7 @@ import { Inspector } from '../components/Inspector'
 import { Issues } from '../components/Issues'
 import { MapView } from '../components/MapView'
 import { Overview } from '../components/Overview'
+import { Progress } from '../components/Progress'
 import { useChatPosition } from '../useChatPosition'
 
 const TABS = [
@@ -26,6 +27,7 @@ export function Workspace() {
   const navigate = useNavigate()
   const [report, setReport] = useState<Report | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [rebuild, setRebuild] = useState<Job | null>(null)
   const [impactOn, setImpactOn] = useState(false)
   const [cited, setCited] = useState<string[] | null>(null)
   const [chat, setChat] = useState<'closed' | 'open' | 'minimised'>('closed')
@@ -40,14 +42,42 @@ export function Workspace() {
   const line = params.get('line') ? Number(params.get('line')) : null
   const issueId = params.get('issue')
 
+  // Load the report. One saved by an older version is rebuilt in the background while the page
+  // shows the analysis steps, instead of waiting silently.
   useEffect(() => {
     let cancelled = false
+    let timer = 0
     setReport(null)
     setError(null)
-    api.report(snapshotId)
-      .then((r) => { if (!cancelled) setReport(r) })
-      .catch((e: Error) => { if (!cancelled) setError(e.message) })
-    return () => { cancelled = true }
+    setRebuild(null)
+    const fail = (e: Error) => { if (!cancelled) setError(e.message) }
+    const watch = (id: string) => {
+      timer = window.setTimeout(() => {
+        api.job(id).then((job) => {
+          if (cancelled) return
+          if (job.stage === 'done') load()
+          else if (job.stage === 'error') setError(job.error ?? 'The analysis could not be updated.')
+          else {
+            setRebuild(job)
+            watch(id)
+          }
+        }).catch(fail)
+      }, 600)
+    }
+    const load = () => {
+      api.reportOrRebuild(snapshotId).then((r) => {
+        if (cancelled) return
+        if ('rebuilding' in r) {
+          setRebuild(r.job)
+          watch(r.job.id)
+        } else {
+          setRebuild(null)
+          setReport(r)
+        }
+      }).catch(fail)
+    }
+    load()
+    return () => { cancelled = true; window.clearTimeout(timer) }
   }, [snapshotId])
 
   useEffect(() => {
@@ -119,7 +149,12 @@ export function Workspace() {
   }
 
   if (!report) {
-    return <div className="centered">Reading the analysis…</div>
+    return rebuild ? (
+      <div className="centered">
+        <Progress job={rebuild} title={`Updating the analysis of ${rebuild.source}`}
+          note="EvidenceLoop has improved since this repository was analysed, so it's reading it again. Nothing is downloaded." />
+      </div>
+    ) : <div className="centered">Reading the analysis…</div>
   }
 
   const repo = report.snapshot.repo

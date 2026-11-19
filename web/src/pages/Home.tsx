@@ -2,42 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { api, type Job, type RepoSummary, workspacePath } from '../api'
 import { Logo, ThemeToggle } from '../components/bits'
+import { Progress } from '../components/Progress'
 import { jobOutcome } from '../jobOutcome'
 import { plural } from '../util'
-
-const STEPS = [
-  { stage: 'fetch', label: 'Fetch the repository and check every file' },
-  { stage: 'parse', label: 'Read and parse the code' },
-  { stage: 'graph', label: 'Map how the files connect' },
-  { stage: 'insights', label: 'Look for problems' },
-]
-const ORDER: Record<string, number> = { queued: -1, fetch: 0, parse: 1, measure: 1, graph: 2, insights: 3, done: 4 }
-
-function Progress({ job }: { job: Job }) {
-  const current = ORDER[job.stage] ?? 0
-  return (
-    <div className="progress" aria-live="polite">
-      <h2>Analysing {job.source.replace(/^https:\/\/github\.com\//, '')}</h2>
-      <span className="faint" style={{ fontSize: 14 }}>
-        Nothing from the repository is run. It's read and parsed only.
-      </span>
-      <ol>
-        {STEPS.map((step, index) => {
-          const state = index < current ? 'done' : index === current ? 'active' : ''
-          const counting = index === current && job.total > 0
-          return (
-            <li key={step.stage} className={state}>
-              <span className="dot" aria-hidden="true">{index < current ? '✓' : index + 1}</span>
-              <span>{step.label}</span>
-              <span className="count">{counting ? `${job.done} of ${job.total}` : ''}</span>
-            </li>
-          )
-        })}
-      </ol>
-      {job.message && current < 4 && <div className="detail">{job.message}</div>}
-    </div>
-  )
-}
 
 export function Home() {
   const navigate = useNavigate()
@@ -97,6 +64,22 @@ export function Home() {
     start(() => api.analyzeUrl(value))
   }
 
+  const remove = async (repo: RepoSummary) => {
+    const label = repo.owner ? `${repo.owner}/${repo.name}` : repo.name
+    const sure = window.confirm(
+      `Remove ${label} from EvidenceLoop?
+
+Its analysis, explanations and questions are deleted ` +
+      'from this computer. Nothing on GitHub changes, and you can analyse it again any time.')
+    if (!sure) return
+    try {
+      await api.removeRepo(repo.snapshot_id)
+      setRepos((list) => (list ?? []).filter((r) => r.snapshot_id !== repo.snapshot_id))
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
   const takeFile = (file: File | undefined) => {
     if (!file) return
     if (!file.name.toLowerCase().endsWith('.zip')) {
@@ -153,7 +136,12 @@ export function Home() {
               <span className="examples">
                 Try
                 {['pallets/itsdangerous', 'pallets/click'].map((example) => (
-                  <button type="button" key={example} onClick={() => setUrl(`github.com/${example}`)}>
+                  <button type="button" key={example} title={`Analyse ${example} now`}
+                    onClick={() => {
+                      const value = `github.com/${example}`
+                      setUrl(value)
+                      start(() => api.analyzeUrl(value))  // an example should just run
+                    }}>
                     {example}
                   </button>
                 ))}
@@ -170,7 +158,8 @@ export function Home() {
         <section className="repos" aria-label="Analysed repositories">
           <h2>Your repositories</h2>
           {repos.map((repo) => (
-            <Link key={repo.snapshot_id} to={workspacePath(repo.snapshot_id)} className="repo-row">
+            <div key={repo.snapshot_id} className="repo-item">
+            <Link to={workspacePath(repo.snapshot_id)} className="repo-row">
               <span className="name">
                 {repo.owner && <span className="owner">{repo.owner} / </span>}
                 {repo.name}
@@ -190,6 +179,9 @@ export function Home() {
                 {repo.commit && <span>commit {repo.commit.slice(0, 7)}</span>}
               </span>
             </Link>
+            <button type="button" className="link-btn repo-remove" onClick={() => remove(repo)}
+              aria-label={`Remove ${repo.name} from EvidenceLoop`}>Remove</button>
+            </div>
           ))}
         </section>
       )}

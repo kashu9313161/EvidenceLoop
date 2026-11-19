@@ -144,8 +144,11 @@ export function ChatPanel({ anchor, repoName, ai, messages, examples, onSend, on
                   <span className="chip-mini" title="Answers open questions">
                     {PROVIDER_NAMES[ai.provider] ?? ai.provider} · {ai.model}
                   </span>
-                  <span className="chip-mini" title="Checks each claim against its cited code">
-                    Judge: LLM{ai.judge.model && ai.judge.model !== ai.model ? ` (${ai.judge.model})` : ''}
+                  <span className={`chip-mini ${ai.judge.available === false ? 'off' : ''}`}
+                    title={ai.judge.reason || 'Checks each claim against its cited code'}>
+                    {ai.judge.kind === 'jev'
+                      ? `Judge: Jev (${ai.judge.model})`
+                      : `Judge: LLM${ai.judge.model && ai.judge.model !== ai.model ? ` (${ai.judge.model})` : ''}`}
                   </span>
                 </>
               ) : <span className="chip-mini off" title={ai.reason}>AI off: set GEMINI_API_KEY</span>}

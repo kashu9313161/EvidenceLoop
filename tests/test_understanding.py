@@ -280,8 +280,10 @@ def test_report_end_to_end(analyzed):
     cycle = next(i for i in report["insights"] if i["rule"] == "import_cycle")
     assert cycle["files"] == ["shop/orders.py", "shop/pricing.py"]
     for evidence in cycle["evidence"]:
-        line = evidence["snippet"]["lines"][0]
+        snippet = evidence["snippet"]
+        line = snippet["lines"][evidence["start"] - snippet["start"]]
         assert "import" in line  # evidence points at the real import line
+        assert snippet["start"] <= evidence["start"]  # with lines of context around it
 
     edges = report["graph"]["edges"]
     assert all(e["tier"] == "confirmed" for e in edges)
@@ -514,3 +516,75 @@ def test_deleting_a_snapshot_removes_its_rows_and_files(isolated_storage):
             assert left == 0, table
     assert get_snapshot(keep) is not None and load_report(keep) is not None
     assert delete_snapshot(gone, service.REPOSITORIES_DIR) is False
+
+
+def test_packages_are_split_into_runtime_and_development(isolated_storage):
+    files = {
+        **SAMPLE,
+        "shop/types.py": b"from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n"
+                         b"    import typing_extensions\n\n\ndef label(x):\n    return str(x)\n",
+        "tests/test_api.py": b"import pytest\nfrom shop.api import orders\n\n\ndef test_x():\n"
+                             b"    assert orders\n",
+    }
+    snapshot = ingest_zip_bytes(make_zip(files), "shop")["snapshot_id"]
+    report = run_full_analysis(snapshot)
+    scope = {e["package"]: e["scope"] for e in report["dependencies"]["external"]
+             if e["kind"] == "external"}
+    assert scope["requests"] == "runtime" and scope["fastapi"] == "runtime"
+    assert scope["pytest"] == "development"  # only tests import it
+    assert scope["typing_extensions"] == "development"  # only for type hints
+    totals = report["summary"]["totals"]
+    assert (totals["packages"], totals["dev_packages"]) == (2, 2)
+
+
+def test_short_evidence_comes_with_context_and_text_files_are_listed(analyzed):
+    _, report = analyzed
+    mutable = next(i for i in report["insights"] if i["rule"] == "mutable_default")
+    evidence = mutable["evidence"][0]
+    snippet = evidence["snippet"]
+    assert snippet["start"] < evidence["start"] or snippet["start"] == 1
+    assert len(snippet["lines"]) > evidence["end"] - evidence["start"] + 1  # lines around it
+    assert "README.md" in report["coverage"]["indexed_files"]
+
+
+def test_dependents_wording_agrees_in_number(analyzed):
+    _, report = analyzed
+    for key in report["summary"]["key_files"]:
+        if key["impact"] == 1:
+            assert "1 file depends on it" in key["why"]
+        elif key["impact"] > 1:
+            assert f"{key['impact']} files depend on it" in key["why"]
+
+
+def test_the_data_folder_can_be_moved(tmp_path):
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [sys.executable, "-c", "from core import config; print(config.DATABASE_PATH)"],
+        capture_output=True, text=True, check=True,
+        env={**__import__("os").environ, "EL_DATA_DIR": str(tmp_path)},
+    ).stdout.strip()
+    assert out == str(tmp_path / "evidenceloop.db")
+
+
+def test_the_tests_fact_reads_correctly(isolated_storage):
+    snapshot = ingest_zip_bytes(make_zip(SAMPLE), "shop")["snapshot_id"]
+    facts = " ".join(run_full_analysis(snapshot)["summary"]["facts"])
+    assert "1 test file reaches" in facts and "modules" in facts
+
+    only_tests = {"pyproject.toml": b"[project]\nname = 'x'\n",
+                  "tests/test_a.py": b"def test_a():\n    assert True\n",
+                  "tests/test_b.py": b"def test_b():\n    assert True\n"}
+    snapshot = ingest_zip_bytes(make_zip(only_tests), "x")["snapshot_id"]
+    facts = " ".join(run_full_analysis(snapshot)["summary"]["facts"])
+    assert "0 of 0" not in facts
+    assert "There are 2 test files, but no module with functions or classes" in facts
+
+
+def test_examples_may_import_packages_the_project_doesnt_declare(isolated_storage):
+    files = {**SAMPLE, "examples/demo.py": b"import flask\n\napp = flask.Flask(__name__)\n"}
+    snapshot = ingest_zip_bytes(make_zip(files), "shop")["snapshot_id"]
+    undeclared = {i["title"] for i in run_full_analysis(snapshot)["insights"]
+                  if i["rule"] == "undeclared_dependency"}
+    assert undeclared == {"`requests` is imported but not declared"}  # flask in examples/ is fine

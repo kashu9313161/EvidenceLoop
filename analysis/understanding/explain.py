@@ -90,14 +90,21 @@ class Prepared:
 
 # --------------------------------------------------------------------------- secrets
 
-_SECRET_NAME = r"[A-Za-z0-9_]*(?:pass(?:word|wd)?|secret|api[_-]?key|access[_-]?key|token|" \
-               r"private[_-]?key|credential)[A-Za-z0-9_]*"
-_ASSIGNED_SECRET = re.compile(
-    rf"""(?P<name>\b{_SECRET_NAME}['"]?\s*(?::|=|:=|=>)\s*)(?P<q>['"`])(?P<value>[^'"`\n]{{4,}})(?P=q)""",
+# A name that holds a secret. Checked against a whole identifier after it is matched, rather than
+# inside the pattern: `[A-Za-z0-9_]*(?:token|...)[A-Za-z0-9_]*` let a long identifier be split
+# every possible way (quadratic: 40,000 characters of "tokentoken..." took 9 seconds).
+_SECRET_WORD = re.compile(
+    r"pass(?:word|wd)?|secret|api[_-]?key|access[_-]?key|token|private[_-]?key|credential",
     re.IGNORECASE,
 )
+_ASSIGNED_VALUE = re.compile(
+    r"""(?P<name>\b(?P<ident>(?>[A-Za-z0-9_]+))['"]?\s*(?::|=|:=|=>)\s*)"""
+    r"""(?P<q>['"`])(?P<value>[^'"`\n]{4,})(?P=q)"""
+)
 _TOKEN_PATTERNS = [
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+    # Bounded, so a "BEGIN ... PRIVATE KEY" with no END can't make every match scan the file.
+    re.compile(r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----.{0,10000}?"
+               r"-----END [A-Z ]{0,40}PRIVATE KEY-----", re.S),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key id
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"),  # GitHub tokens
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{30,}\b"),
@@ -122,12 +129,12 @@ def redact_secrets(text: str) -> tuple[str, int]:
 
     def assigned(match: re.Match) -> str:
         nonlocal count
-        if match.group("value") == "[redacted]":
+        if match.group("value") == "[redacted]" or not _SECRET_WORD.search(match.group("ident")):
             return match.group(0)
         count += 1
         return f"{match.group('name')}{match.group('q')}[redacted]{match.group('q')}"
 
-    return _ASSIGNED_SECRET.sub(assigned, text), count
+    return _ASSIGNED_VALUE.sub(assigned, text), count
 
 
 # --------------------------------------------------------------------------- input

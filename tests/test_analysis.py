@@ -441,3 +441,17 @@ def test_missing_file_on_disk_is_failed_not_crash(snapshot_id, isolated_storage)
 def test_unknown_snapshot_raises(isolated_storage):
     with pytest.raises(AnalysisError, match="Unknown snapshot"):
         analyze_snapshot("zip-doesnotexist")
+
+
+def test_an_empty_handler_that_leaves_a_checked_fallback_is_not_swallowing():
+    from analysis.python.quality import analyze_python
+
+    fallback = ("def f(raw):\n    ts = None\n    try:\n        ts = int(raw)\n"
+                "    except Exception:\n        pass\n    if ts is None:\n"
+                "        raise ValueError('bad')\n    return ts\n")
+    swallowed = "def f():\n    try:\n        risky()\n    except Exception:\n        pass\n"
+    unused = ("def f(raw):\n    try:\n        x = int(raw)\n    except Exception:\n"
+              "        pass\n    return 1\n")
+    assert [s.rule for s in analyze_python(fallback).smells] == []
+    assert [s.rule for s in analyze_python(swallowed).smells] == ["swallowed_exception"]
+    assert [s.rule for s in analyze_python(unused).smells] == ["swallowed_exception"]

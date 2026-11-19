@@ -291,7 +291,15 @@ def test_without_ai_an_open_question_explains_what_to_do(shop, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     result = ask(shop, "how are orders priced?")
     assert result["status"] == "needs_ai" and "GEMINI_API_KEY" in result["summary"]
-    assert "where is load_data" in result["summary"]
+    assert "in the terminal before starting EvidenceLoop" in result["summary"]
+    assert result["route"] == "An open question: it needs AI to answer."
+    # The example lookups name a real function of this repository, not another project's.
+    report = load_report(shop)
+    functions = {m["name"].rsplit(".", 1)[-1] for f in report["files"]
+                 for m in f["function_metrics"]}
+    example = result["summary"].split('"where is ')[1].split('"')[0]
+    assert example in functions and "load_data" not in result["summary"]
+    assert rows("asks") == []  # an unanswered question isn't kept in the history
 
 
 def test_an_evaluator_outage_leaves_claims_insufficient(shop):
@@ -473,7 +481,7 @@ def test_api_lookup_answers_as_you_type(client, shop, monkeypatch):
 
 def test_api_ai_describes_the_models_without_the_key(client, monkeypatch):
     for name in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "EL_PROVIDER",
-                 "EL_MODEL_ASK", "EL_MODEL_JUDGE"):
+                 "EL_MODEL_ASK", "EL_MODEL_JUDGE", "EL_EVALUATOR", "TYPESAFE_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     off = client.get("/api/ai").json()
     assert off["available"] is False and "GEMINI_API_KEY" in off["reason"]
@@ -482,7 +490,7 @@ def test_api_ai_describes_the_models_without_the_key(client, monkeypatch):
     on = client.get("/api/ai").json()
     assert on == {"available": True, "provider": "gemini", "model": "gemini-3.5-flash-lite",
                   "judge": {"kind": "llm", "provider": "gemini",
-                            "model": "gemini-3.5-flash-lite"}}
+                            "model": "gemini-3.5-flash-lite", "available": True, "reason": ""}}
     monkeypatch.setenv("ANTHROPIC_API_KEY", "a-secret-key")
     assert client.get("/api/ai").json()["provider"] == "anthropic"
     assert "secret" not in client.get("/api/ai").text
@@ -525,3 +533,18 @@ def test_an_older_database_gains_the_new_column(isolated_storage):
     columns = [r[1] for r in sqlite3.connect(config.DATABASE_PATH).execute(
         "PRAGMA table_info(asks)")]
     assert columns.count("meta") == 1
+
+
+def test_where_leaves_out_overload_stubs(isolated_storage):
+    from intelligence.ask import answer_lookup
+
+    typed = (b"import typing as t\n\n\nclass Box:\n    @t.overload\n"
+             b"    def get(self, key: int) -> int: ...\n\n    @t.overload\n"
+             b"    def get(self, key: str) -> str: ...\n\n    def get(self, key):\n"
+             b"        return key\n")
+    snapshot = ingest_zip_bytes(make_zip({**SAMPLE, "shop/typed.py": typed}), "shop")["snapshot_id"]
+    run_full_analysis(snapshot)
+    found = answer_lookup(snapshot, "where is get")
+    assert found["summary"] == "`get` is defined in 1 place (plus 2 type overloads)."
+    assert [c["text"] for c in found["claims"]] == [
+        "`Box.get` (method of Box) is defined in shop/typed.py, lines 11–12."]

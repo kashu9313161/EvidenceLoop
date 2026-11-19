@@ -411,17 +411,35 @@ li code,
   margin: 0 0 8px;
 }
 
+.repo-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid var(--rule);
+}
+
+.repo-item:last-child {
+  border-bottom: 1px solid var(--rule);
+}
+
 .repo-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 6px 24px;
   padding: 18px 4px;
-  border-top: 1px solid var(--rule);
   color: inherit;
 }
 
-.repo-row:last-child {
-  border-bottom: 1px solid var(--rule);
+.repo-remove {
+  padding: 6px 4px;
+  font-size: 13px;
+  color: var(--paper-3);
+}
+
+.repo-remove:hover,
+.repo-remove:focus-visible {
+  color: var(--signal);
 }
 
 .repo-row:hover {
@@ -2461,4 +2479,54 @@ details.disclosure ul {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--paper-3);
+}
+
+/* ------------------------------------------------------------------ professional polish */
+
+/* Text files (README, docs, config) in the Files tree: present, but quieter than code. */
+.tree .file.text .n {
+  color: var(--paper-3);
+  font-style: italic;
+}
+
+.explain-hint {
+  margin: 8px 0 0 !important;
+  font-size: 13px !important;
+  color: var(--paper-3);
+}
+
+/* Map settings can be folded away (folded by default on a phone). */
+.map-controls-toggle {
+  justify-self: start;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--paper-2);
+}
+
+.map-controls.folded {
+  width: auto;
+  padding: 8px 12px;
+}
+
+/* Leave the bottom-right corner to the chat button. */
+.legend {
+  max-width: min(720px, calc(100% - 112px));
+}
+
+.file-side,
+.tree {
+  padding-bottom: 84px;
+}
+
+/* No keyboard shortcut to advertise on a touch screen. */
+@media (hover: none) {
+  .search .kbd {
+    display: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .map-hint {
+    display: none;
+  }
 }

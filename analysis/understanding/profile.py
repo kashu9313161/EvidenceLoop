@@ -100,7 +100,8 @@ class Manifest:
     kind: str  # requirements | pyproject | package.json | setup.py
     requirements: list[Requirement] = field(default_factory=list)
     # Declares a reusable library: a "Libraries" classifier in pyproject.toml, or a
-    # package.json with `exports`/`types` (or a `main` on a package that isn't private).
+    # package.json with `exports`/`types` (or a `main`, `files` or `publishConfig` on a package
+    # that isn't private).
     library: bool = False
 
     @property
@@ -134,7 +135,27 @@ def _pep508(entry: str) -> tuple[str, str] | None:
     return match.group(1), (match.group(3) or "").strip()
 
 
+def _table(value: object) -> dict:
+    """A TOML table or JSON object, or {} when a repository put something else there."""
+    return value if isinstance(value, dict) else {}
+
+
+def _strings(value: object) -> list[str]:
+    """A list of strings, or [] when it isn't one (a lone string is not a list of names)."""
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
 def parse_manifest(path: str, text: str) -> Manifest | None:
+    """The manifest, or None when it can't be read. Manifests come from untrusted
+    repositories: a file nested thousands of levels deep, or a field of an unexpected type, is
+    an unreadable manifest, never a failure of the whole analysis."""
+    try:
+        return _parse_manifest(path, text)
+    except (RecursionError, MemoryError, TypeError, AttributeError, ValueError):
+        return None
+
+
+def _parse_manifest(path: str, text: str) -> Manifest | None:
     name = PurePosixPath(path).name.lower()
     if name.endswith(".txt") and "requirement" in name:
         manifest = Manifest(path, "requirements")
@@ -154,19 +175,19 @@ def parse_manifest(path: str, text: str) -> Manifest | None:
         except tomllib.TOMLDecodeError:
             return None
         manifest = Manifest(path, "pyproject")
-        classifiers = data.get("project", {}).get("classifiers", [])
-        manifest.library = any(isinstance(c, str) and "Software Development :: Libraries" in c
-                               for c in classifiers)
-        entries: list[str] = list(data.get("project", {}).get("dependencies", []))
-        for group in data.get("project", {}).get("optional-dependencies", {}).values():
-            entries.extend(group)
-        for group in data.get("dependency-groups", {}).values():
-            entries.extend(e for e in group if isinstance(e, str))
-        entries.extend(data.get("build-system", {}).get("requires", []))
-        poetry = data.get("tool", {}).get("poetry", {})
+        project = _table(data.get("project"))
+        manifest.library = any("Software Development :: Libraries" in c
+                               for c in _strings(project.get("classifiers")))
+        entries: list[str] = _strings(project.get("dependencies"))
+        for group in _table(project.get("optional-dependencies")).values():
+            entries.extend(_strings(group))
+        for group in _table(data.get("dependency-groups")).values():
+            entries.extend(_strings(group))
+        entries.extend(_strings(_table(data.get("build-system")).get("requires")))
+        poetry = _table(_table(data.get("tool")).get("poetry"))
         for section in ("dependencies", "dev-dependencies"):
-            for dep, spec in poetry.get(section, {}).items():
-                if dep.lower() != "python":
+            for dep, spec in _table(poetry.get(section)).items():
+                if isinstance(dep, str) and dep.lower() != "python":
                     entries.append(f"{dep}{spec if isinstance(spec, str) else ''}")
         for entry in entries:
             parsed = _pep508(entry)
@@ -183,14 +204,18 @@ def parse_manifest(path: str, text: str) -> Manifest | None:
             return None
         manifest = Manifest(path, "package.json")
         if isinstance(data, dict):
+            # Published for others to import: an entry point or type definitions, or (express
+            # has neither `main` nor `exports`) a list of files to publish, on a package that
+            # isn't private. A `bin` alone makes a command-line tool, not a library.
+            published = data.get("private") is not True and bool(
+                data.get("main") or data.get("files") or data.get("publishConfig"))
             manifest.library = bool(
-                data.get("exports") or data.get("types") or data.get("typings")
-                or (data.get("main") and data.get("private") is not True)
+                data.get("exports") or data.get("types") or data.get("typings") or published
             )
         else:
             return None
         for section in ("dependencies", "devDependencies", "peerDependencies"):
-            for dep, spec in (data.get(section) or {}).items():
+            for dep, spec in _table(data.get(section)).items():
                 if isinstance(spec, str):
                     pinned = bool(re.match(r"^\d", spec))
                     manifest.requirements.append(

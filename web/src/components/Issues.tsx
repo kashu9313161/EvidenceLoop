@@ -28,7 +28,7 @@ function IssueBody({ issue, onOpenCode }: { issue: Issue; onOpenCode: Props['onO
       </div>
       <p className="confidence">
         {issue.confidence === 'confirmed'
-          ? 'Confirmed: the rule matched the code exactly.'
+          ? 'Found exactly at these lines. Whether it matters here is still your call.'
           : 'Likely: a strong signal, but worth a quick human check.'}
       </p>
       {issue.evidence.map((evidence, index) => (

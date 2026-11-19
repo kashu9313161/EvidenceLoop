@@ -6,7 +6,10 @@ then open http://127.0.0.1:8000 (the built React app is served from web/dist).
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
+import re
 import threading
 import time
 import uuid
@@ -35,11 +38,14 @@ from ingestion.service import (
 )
 from intelligence.ask import AskError, answer_lookup, load_asks
 from intelligence.ask import ask as run_ask
+from intelligence.evaluators.choice import judge_description
 from intelligence.providers import Provider, ProviderError, ai_status, provider_for
 from storage.database import (
+    delete_snapshot,
     get_connection,
     get_snapshot,
     initialize_database,
+    like_literal,
     list_snapshots,
     list_symbols,
     search_symbols,
@@ -54,9 +60,11 @@ UNKNOWN_REPOSITORY = ("This repository isn't in EvidenceLoop any more. "
 
 app = FastAPI(title="EvidenceLoop", version="2.0.0",
               description="Evidence-backed repository intelligence")
+DEV_ORIGINS = {"http://localhost:5173", "http://127.0.0.1:5173"}  # `npm run dev` (Vite)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=sorted(DEV_ORIGINS),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -79,23 +87,106 @@ def _hostname(value: str) -> str:
     return (urlsplit(value if "//" in value else f"//{value}").hostname or "").lower()
 
 
+def trusted_origin(origin: str, host: str) -> bool:
+    """The page that sent a request is this app: same scheme-host-port as the server (the
+    port matters: another program on localhost:3000 is a different site), or the dev server."""
+    if origin in DEV_ORIGINS:
+        return True
+    parts = urlsplit(origin)
+    return parts.scheme in {"http", "https"} and parts.netloc.lower() == host.lower()
+
+
+# What browsers say about who started a request (Fetch Metadata). Anything but the app's own
+# pages ("same-origin") or the user typing the address ("none") was started by another page.
+OWN_FETCH_SITES = {"same-origin", "none"}
+
+MAX_BODY_BYTES = 1024 * 1024  # JSON requests are a few hundred bytes; uploads have their own cap
+UPLOAD_PATH = "/api/analyze/upload"
+
+
+def _inline_script_hashes(index: Path) -> list[str]:
+    """CSP hashes of the inline scripts in the built page (the theme set before first paint), so
+    the policy can allow exactly those and no other inline script."""
+    try:
+        html = index.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [f"'sha256-{base64.b64encode(hashlib.sha256(body.encode()).digest()).decode()}'"
+            for body in re.findall(r"<script>(.*?)</script>", html, re.S)]
+
+
+def content_security_policy() -> str:
+    scripts = " ".join(["'self'", *_inline_script_hashes(WEB_DIST / "index.html")])
+    return "; ".join([
+        "default-src 'self'",
+        f"script-src {scripts}",
+        "style-src 'self' 'unsafe-inline'",  # React and the code highlighter set style attributes
+        "img-src 'self' data: blob:",
+        "font-src 'self' data:",
+        "connect-src 'self'",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",  # no other site can put this app in a frame (clickjacking)
+    ])
+
+
+SECURITY_HEADERS = {
+    "Content-Security-Policy": content_security_policy(),
+    "X-Frame-Options": "DENY",  # the same, for browsers that ignore frame-ancestors
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Opener-Policy": "same-origin",
+}
+
+
+async def security_headers(request: Request, call_next):
+    """Every response, refusals included: no framing by other sites, a content security
+    policy, no content-type sniffing and no referrer. Bodies larger than any real request are
+    refused before they are read (the upload route allows a 100 MB ZIP)."""
+    length = request.headers.get("content-length", "")
+    limit = MAX_UPLOAD_BYTES + MAX_BODY_BYTES if request.url.path == UPLOAD_PATH \
+        else MAX_BODY_BYTES
+    if length.isdigit() and int(length) > limit:
+        response = JSONResponse({"detail": "The request is too large."}, status_code=413)
+    else:
+        response = await call_next(request)
+    for name, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    return response
+
+
 @app.middleware("http")
 async def local_requests_only(request: Request, call_next):
     """This server holds the code of every analysed repository and has no login, so:
     - answer only to its own host names, which stops DNS rebinding (a web page whose domain
       is pointed at 127.0.0.1 reading the API);
-    - refuse changes sent from another site's page. Browsers send a cross-site form upload
-      without asking first, so CORS alone doesn't stop one.
+    - refuse changes sent from any other page, including other programs on localhost. Browsers
+      send a cross-site form upload without asking first, so CORS alone doesn't stop one;
+    - refuse API requests a browser marks as started by another page, so an <img> pointing at
+      /api/report can't make the server analyse a repository.
+    Tools that aren't browsers (curl, scripts) send neither header and are unaffected.
     """
-    hosts = allowed_hosts()
-    if _hostname(request.headers.get("host", "")) not in hosts:
+    host = request.headers.get("host", "")
+    if _hostname(host) not in allowed_hosts():
         return JSONResponse({"detail": "Unknown host name."}, status_code=421)
     origin = request.headers.get("origin")
+    dev = origin in DEV_ORIGINS
     if request.method not in SAFE_METHODS and origin is not None \
-            and _hostname(origin) not in hosts:
+            and not trusted_origin(origin, host):
+        return JSONResponse({"detail": "Requests from other sites are not accepted."},
+                            status_code=403)
+    site = request.headers.get("sec-fetch-site")
+    if request.url.path.startswith("/api/") and site is not None \
+            and site not in OWN_FETCH_SITES and not dev:
         return JSONResponse({"detail": "Requests from other sites are not accepted."},
                             status_code=403)
     return await call_next(request)
+
+
+# Registered last, so it is the outermost layer and its headers reach every response, the
+# host and origin refusals above included.
+app.middleware("http")(security_headers)
 
 
 # --------------------------------------------------------------------------- jobs
@@ -173,9 +264,30 @@ def _pregenerate_explanations(snapshot_id: str) -> None:
                          daemon=True).start()
 
 
-def _start(source: str, ingest) -> Job:
-    job = Job(id=uuid.uuid4().hex[:12], source=source)
+MAX_RUNNING_JOBS = 4  # analyses at once; each holds a thread, and an upload up to 100 MB
+FINISHED_JOB_TTL = 3600  # seconds a finished job's status stays available
+
+
+def _running_jobs() -> int:
     with _lock:
+        return sum(1 for j in _jobs.values() if j.stage not in {"done", "error"})
+
+
+def _check_capacity() -> None:
+    if _running_jobs() >= MAX_RUNNING_JOBS:
+        raise HTTPException(429, f"{MAX_RUNNING_JOBS} analyses are already running. Try again "
+                                 "when one finishes.")
+
+
+def _start(source: str, ingest, snapshot_id: str | None = None) -> Job:
+    _check_capacity()
+    # snapshot_id is known up front for re-runs, so a duplicate request can find this job.
+    job = Job(id=uuid.uuid4().hex[:12], source=source, snapshot_id=snapshot_id)
+    now = time.time()
+    with _lock:
+        for old in [k for k, j in _jobs.items()
+                    if j.finished is not None and now - j.finished > FINISHED_JOB_TTL]:
+            del _jobs[old]  # finished long ago: nobody polls it any more
         _jobs[job.id] = job
     threading.Thread(target=_run, args=(job, ingest), daemon=True).start()
     return job
@@ -211,6 +323,7 @@ def analyze(request: AnalyzeRequest) -> dict:
 
 @app.post("/api/analyze/upload")
 async def analyze_upload(file: Annotated[UploadFile, File()]) -> dict:
+    _check_capacity()  # before reading up to 100 MB into memory
     data = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "The ZIP is larger than 100 MB.")
@@ -265,17 +378,60 @@ def _require_snapshot(snapshot_id: str):
     return snapshot
 
 
+class RemoveRequest(BaseModel):
+    snapshot: str
+
+
+@app.post("/api/repos/remove")
+def remove_repo(request: RemoveRequest) -> dict:
+    """Delete a repository's analysis from this computer: its rows (report, files, symbols,
+    explanations, questions, send log) and its extracted files. Nothing on GitHub changes. A
+    POST, so other sites can't send it."""
+    _require_snapshot(request.snapshot)
+    with _lock:
+        running = any(j.snapshot_id == request.snapshot and j.stage not in {"done", "error"}
+                      for j in _jobs.values())
+    if running:
+        raise HTTPException(409, "This repository is still being analysed. Remove it when "
+                                 "that finishes.")
+    delete_snapshot(request.snapshot)
+    return {"removed": request.snapshot}
+
+
+def _repo_label(snapshot_id: str) -> str:
+    """`pallets/click`, or a ZIP's name, for progress messages."""
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT r.owner, r.name FROM snapshots s JOIN repositories r "
+            "ON r.repository_id = s.repository_id WHERE s.snapshot_id = ?",
+            (snapshot_id,)).fetchone()
+    if row is None or not row["name"]:
+        return snapshot_id
+    return f"{row['owner']}/{row['name']}" if row["owner"] else row["name"]
+
+
 @app.get("/api/report")
-def report(snapshot: str = Query(...)) -> dict:
+def report(snapshot: str = Query(...), background: bool = False):
+    """The analysis report. One saved by an older version is rebuilt: with `background=1` that
+    happens in a job (202 with the job, so the page can show progress; a second request joins
+    the same job), otherwise right away."""
     _require_snapshot(snapshot)
     found = load_report(snapshot)
-    if found is None:
-        # Snapshots ingested before this version: analyze now (fast, local, no network).
-        try:
-            found = run_full_analysis(snapshot)
-        except (AnalysisError, ReportError) as exc:
-            raise HTTPException(409, str(exc)) from exc
-    return found
+    if found is not None:
+        return found
+    if background:
+        with _lock:
+            job = next((j for j in _jobs.values() if j.snapshot_id == snapshot
+                        and j.stage not in {"done", "error"}), None)
+        if job is None:
+            job = _start(_repo_label(snapshot),
+                         lambda: {"snapshot_id": snapshot, "reanalyze": True},
+                         snapshot_id=snapshot)
+        return JSONResponse({"rebuilding": True, "job": asdict(job)}, status_code=202)
+    try:
+        return run_full_analysis(snapshot)
+    except (AnalysisError, ReportError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/file")
@@ -304,7 +460,7 @@ def file_detail(snapshot: str = Query(...), path: str = Query(...)) -> dict:
 
 
 @app.get("/api/search")
-def search(snapshot: str = Query(...), q: str = Query(..., min_length=1)) -> dict:
+def search(snapshot: str = Query(...), q: str = Query(..., min_length=1, max_length=200)) -> dict:
     _require_snapshot(snapshot)
     initialize_database()
     needle = q.strip()
@@ -312,8 +468,8 @@ def search(snapshot: str = Query(...), q: str = Query(..., min_length=1)) -> dic
     with get_connection() as connection:
         paths = [r["relative_path"] for r in connection.execute(
             "SELECT relative_path FROM files WHERE snapshot_id = ? AND status != 'skipped' "
-            "AND relative_path LIKE ? ORDER BY length(relative_path) LIMIT 12",
-            (snapshot, f"%{needle}%"))]
+            "AND relative_path LIKE ? ESCAPE '\\' ORDER BY length(relative_path) LIMIT 12",
+            (snapshot, f"%{like_literal(needle)}%"))]
         content = []
         if terms:
             match = " ".join(f'"{t}"*' for t in terms)
@@ -381,8 +537,7 @@ def ai_info() -> dict:
     if answer is None:
         return {"available": False, "reason": ai_status()[1] or "AI isn't available."}
     return {"available": True, "provider": answer.name, "model": answer.model,
-            "judge": {"kind": "llm", "provider": judge.name if judge else None,
-                      "model": judge.model if judge else None}}
+            "judge": judge_description(judge)}
 
 
 # --------------------------------------------------------------------------- explanations

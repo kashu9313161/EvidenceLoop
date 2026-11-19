@@ -17,8 +17,17 @@ SHALLOW_EXTENSIONS = JS_EXTENSIONS | TS_EXTENSIONS
 _Q = r"(?P<q>['\"])(?P<mod>[^'\"\n]+)(?P=q)"
 _START = r"(?<![.\w$])"
 
+# The clause is tokens separated by whitespace, each token atomic, so a run of spaces can be
+# matched only one way. (The old `[\w$*{}\s,]+?\s*from` let the clause and `\s*` split the same
+# spaces every possible way: `import` and a few thousand spaces took seconds — a ReDoS a
+# repository could trigger with one crafted file.) A clause never contains the word `import`, so
+# it stops at the next one: `import` repeated without `from` costs one step per occurrence
+# instead of scanning ahead from each. The 400-token cap, far more than any real import list,
+# bounds the rest. (`from` can't be excluded the same way: `import { from } from 'rxjs'`.)
 IMPORT_FROM = re.compile(
-    _START + r"import\s+(?P<type>type\s+)?(?P<clause>[\w$*{}\s,]+?)\s*from\s*" + _Q
+    _START + r"import\s+(?P<type>type\s+)?"
+    r"(?P<clause>(?!import\b)(?>[\w$*{},]+)(?:\s+(?!import\b)(?>[\w$*{},]+)){0,400}?)"
+    r"\s*from\s*" + _Q
 )
 SIDE_EFFECT = re.compile(_START + r"import\s*" + _Q)
 DYNAMIC = re.compile(_START + r"import\s*\(\s*" + _Q + r"\s*\)")

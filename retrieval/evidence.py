@@ -31,6 +31,25 @@ code file files function functions class classes method methods project repo rep
 explain tell show find happens happen handled handle called call calls""".split())
 
 
+# Files that usually hold credentials rather than code: never sent to an AI provider as
+# evidence, whatever the redaction patterns would catch. Code named after secrets
+# (secret_manager.py) is not matched; data and config files named after them are.
+_SECRET_FILE = re.compile(
+    r"(?:^|/)(?:"
+    r"\.env(?:\.[^/]*)?|\.npmrc|\.pypirc|\.netrc|\.htpasswd|\.git-credentials"
+    r"|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?"
+    r"|[^/]*\.(?:pem|key|p12|pfx|jks|keystore)"
+    r"|[^/]*(?:secret|credential|password)s?[^/]*\.(?:json|ya?ml|toml|ini|cfg|conf|env|txt"
+    r"|properties|xml)"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def is_secret_file(path: str) -> bool:
+    return bool(_SECRET_FILE.search(path))
+
+
 def max_items() -> int:
     try:
         return max(1, int(os.environ.get("EL_MAX_EVIDENCE_ITEMS", "") or DEFAULT_MAX_ITEMS))
@@ -251,8 +270,8 @@ def build_evidence(snapshot_id: str, question: str, report: dict, files: Snapsho
     for cand in ranked:
         if len(items) >= limit - reserve:
             break
-        if per_file.get(cand.path, 0) >= 3:
-            continue  # spread the evidence over several files
+        if per_file.get(cand.path, 0) >= 3 or is_secret_file(cand.path):
+            continue  # spread the evidence over several files; never send a secrets file
         item = make_item(files, f"E{len(items) + 1}", cand.path, cand.start, cand.end, "code",
                          cand.label)
         if item:
@@ -263,6 +282,8 @@ def build_evidence(snapshot_id: str, question: str, report: dict, files: Snapsho
     for edge in _neighbour_edges(report, chosen)[:MAX_GRAPH_ITEMS]:
         if len(items) >= limit:
             break
+        if is_secret_file(edge["source"]):
+            continue
         line = min(edge["lines"])
         item = make_item(files, f"E{len(items) + 1}", edge["source"], line, max(edge["lines"]),
                          "import", f"{edge['source']} imports {edge['target']}")
@@ -273,6 +294,8 @@ def build_evidence(snapshot_id: str, question: str, report: dict, files: Snapsho
         if len(items) >= limit:
             break
         evidence = insight["evidence"][0]
+        if is_secret_file(evidence["path"]):
+            continue
         item = make_item(files, f"E{len(items) + 1}", evidence["path"], evidence["start"],
                          evidence["end"], "issue", f"Issue: {insight['title']}")
         if item:

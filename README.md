@@ -27,12 +27,16 @@ repository is ever run.
 ```bash
 python -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
-cd web && npm install && npm run build && cd ..
+pip install -e ".[dev]"              # or ".[ai]" to use it with Claude/Jev, or "." for no AI SDKs
+cd web && npm install && npm run build && cd ..   # needs Node 20 or newer
 python -m cli.main serve             # then open http://127.0.0.1:8000
 ```
 
-Checks: `ruff check .`, `pytest -q` (offline) `npm test` and `npm run build` in `web/`.
+Checks: `ruff check .`, `pytest -q` (offline), `npm test` and `npm run build` in `web/`.
+
+Analyses are kept in `data/` in the project (the database and the extracted repositories). Set
+`EL_DATA_DIR` to keep them somewhere else. Remove a repository from the home page's list to delete
+its analysis, explanations and questions from this computer; nothing on GitHub changes.
 
 Use `127.0.0.1` rather than `localhost`: on Windows `localhost` tries IPv6 first and adds a
 noticeable delay to every request. The server only answers on this machine. Without a token,
@@ -66,6 +70,12 @@ judge scores support at least 0.80, sufficiency at least 0.70 and contradiction 
 (`EL_T_SUPPORT`, `EL_T_SUFFICIENCY`, `EL_T_CONTRADICTION`). These thresholds aren't calibrated yet.
 `EL_MODEL_ASK` and `EL_MODEL_JUDGE` choose the models. Every call to a provider, with the exact
 prompt, is logged in the `provider_sends` table.
+
+The judge can be TypeSafe's Jev instead of the LLM: set `EL_EVALUATOR=jev` and
+`TYPESAFE_API_KEY` (`EL_JEV_VERSION` pins `jev-1.13.0` or `jev-1.14.0`; default `jev-1.14.0`). Which
+one should be the default, and at what thresholds, is decided by Gate A: label the cases in
+`evaluation/gate_a/candidates.yaml`, then run `python -m evaluation.gate_a.run`. See
+[docs/decisions/gate-a.md](docs/decisions/gate-a.md).
 
 ## Learn more
 

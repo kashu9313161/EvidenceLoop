@@ -121,7 +121,7 @@ def _functions(ctx: InsightContext) -> list[Insight]:
                 severity = "medium"
             facts = []
             if complex_:
-                facts.append(f"{fn.complexity} independent paths")
+                facts.append(f"{fn.complexity} branches to follow (if, loops, exceptions)")
             if long_:
                 facts.append(f"{fn.lines} lines")
             if deep:
@@ -313,7 +313,10 @@ def _dependencies(ctx: InsightContext) -> list[Insight]:
             continue
         for path in sorted(use.files):
             name = PurePosixPath(path).name
-            if is_test_path(path) or name in {"setup.py", "noxfile.py", "conf.py", "bench.py"}:
+            # Examples and docs code often imports extras on purpose (a web framework in a demo);
+            # that isn't a missing dependency of the project itself.
+            if is_test_path(path) or path in ctx.supporting \
+                    or name in {"setup.py", "noxfile.py", "conf.py", "bench.py"}:
                 continue
             quality = ctx.files.get(path, {}).get("quality")
             if quality is not None and all(

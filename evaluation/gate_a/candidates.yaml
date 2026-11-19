@@ -1,0 +1,1322 @@
+# Gate A, step 1: candidate cases for the evaluator (judge(claim, evidence)).
+# Drafted from the analysed snapshots; evidence.text is copied exactly from the file.
+# Fill in human_label with one of the four labels below (it may differ from the
+# suggestion). Leave a case's human_label empty to exclude it.
+#
+# Labels:
+#   supports                the evidence alone shows the claim is true
+#   not_supported           the evidence shows the claim is false
+#   related_not_supporting  same file or names, but the evidence doesn't establish the claim
+#   ambiguous               partly true, or depends on context outside the evidence
+version: 1
+suggested_counts: {supports: 25, not_supported: 15, related_not_supporting: 10, ambiguous: 10}
+cases:
+  - id: itsd-01
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "SigningAlgorithm.verify_signature compares the given signature with the expected one using hmac.compare_digest."
+    evidence:
+      path: src/itsdangerous/signer.py
+      start: 24
+      end: 28
+      text: |2-
+            def verify_signature(self, key: bytes, value: bytes, sig: bytes) -> bool:
+                """Verifies the given signature matches the expected
+                signature.
+                """
+                return hmac.compare_digest(sig, self.get_signature(key, value))
+    suggested_label: supports
+    reason: "Line 28 returns hmac.compare_digest(sig, self.get_signature(key, value))."
+    human_label:
+  - id: itsd-02
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "NoneAlgorithm always returns an empty signature."
+    evidence:
+      path: src/itsdangerous/signer.py
+      start: 31
+      end: 37
+      text: |2-
+        class NoneAlgorithm(SigningAlgorithm):
+            """Provides an algorithm that does not perform any signing and
+            returns an empty signature.
+            """
+
+            def get_signature(self, key: bytes, value: bytes) -> bytes:
+                return b""
+    suggested_label: supports
+    reason: "get_signature returns b\"\" unconditionally."
+    human_label:
+  - id: itsd-03
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "itsdangerous avoids SHA-1 so that it works on FIPS builds."
+    evidence:
+      path: src/itsdangerous/signer.py
+      start: 40
+      end: 45
+      text: |2-
+        def _lazy_sha1(string: bytes = b"") -> t.Any:
+            """Don't access ``hashlib.sha1`` until runtime. FIPS builds may not include
+            SHA-1, in which case the import and use as a default would fail before the
+            developer can configure something else.
+            """
+            return hashlib.sha1(string)
+    suggested_label: ambiguous
+    reason: "It only delays touching hashlib.sha1 until runtime; SHA-1 is still the default, so 'avoids' is half true."
+    human_label:
+  - id: itsd-04
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "Signer's default digest method is SHA-256."
+    evidence:
+      path: src/itsdangerous/signer.py
+      start: 114
+      end: 120
+      text: |2-
+            #: The default digest method to use for the signer. The default is
+            #: :func:`hashlib.sha1`, but can be changed to any :mod:`hashlib` or
+            #: compatible object. Note that the security of the hash alone
+            #: doesn't apply when used intermediately in HMAC.
+            #:
+            #: .. versionadded:: 0.14
+            default_digest_method: t.Any = staticmethod(_lazy_sha1)
+    suggested_label: not_supported
+    reason: "The default is _lazy_sha1 and the comment says hashlib.sha1."
+    human_label:
+  - id: itsd-05
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "The default key derivation for Signer is 'hmac'."
+    evidence:
+      path: src/itsdangerous/signer.py
+      start: 122
+      end: 127
+      text: |2-
+            #: The default scheme to use to derive the signing key from the
+            #: secret key and salt. The default is ``django-concat``. Possible
+            #: values are ``concat``, ``django-concat``, and ``hmac``.
+            #:
+            #: .. versionadded:: 0.14
+            default_key_derivation: str = "django-concat"
+    suggested_label: not_supported
+    reason: "default_key_derivation is \"django-concat\"; hmac is only one of the options."
+    human_label:
+  - id: itsd-06
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "By default Signer uses the salt b\"itsdangerous.Signer\" and the separator b\".\"."
+    evidence:
+      path: src/itsdangerous/signer.py
+      start: 129
+      end: 137
+      text: |2-
+            def __init__(
+                self,
+                secret_key: str | bytes | cabc.Iterable[str] | cabc.Iterable[bytes],
+                salt: str | bytes | None = b"itsdangerous.Signer",
+                sep: str | bytes = b".",
+                key_derivation: str | None = None,
+                digest_method: t.Any | None = None,
+                algorithm: SigningAlgorithm | None = None,
+            ):
+    suggested_label: supports
+    reason: "The constructor defaults are salt=b\"itsdangerous.Signer\" and sep=b\".\"."
+    human_label:
+  - id: itsd-07
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "Signer raises ValueError if the separator is a character from the base64 alphabet."
+    evidence:
+      path: src/itsdangerous/signer.py
+      start: 146
+      end: 151
+      text: |2-
+                if self.sep in _base64_alphabet:
+                    raise ValueError(
+                        "The given separator cannot be used because it may be"
+                        " contained in the signature itself. ASCII letters,"
+                        " digits, and '-_=' must not be used."
+                    )
+    suggested_label: supports
+    reason: "If self.sep is in _base64_alphabet a ValueError is raised."
+    human_label:
+  - id: itsd-08
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "Signer.sign uses the newest secret key to sign values."
+    evidence:
+      path: src/itsdangerous/signer.py
+      start: 175
+      end: 180
+      text: |2-
+            @property
+            def secret_key(self) -> bytes:
+                """The newest (last) entry in the :attr:`secret_keys` list. This
+                is for compatibility from before key rotation support was added.
+                """
+                return self.secret_keys[-1]
+    suggested_label: related_not_supporting
+    reason: "This only shows the secret_key property returns the newest key; nothing here shows sign() uses it."
+    human_label:
+  - id: itsd-09
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "Signer.derive_key raises TypeError for an unknown key derivation method."
+    evidence:
+      path: src/itsdangerous/signer.py
+      start: 200
+      end: 213
+      text: |2-
+                if self.key_derivation == "concat":
+                    return t.cast(bytes, self.digest_method(self.salt + secret_key).digest())
+                elif self.key_derivation == "django-concat":
+                    return t.cast(
+                        bytes, self.digest_method(self.salt + b"signer" + secret_key).digest()
+                    )
+                elif self.key_derivation == "hmac":
+                    mac = hmac.new(secret_key, digestmod=self.digest_method)
+                    mac.update(self.salt)
+                    return mac.digest()
+                elif self.key_derivation == "none":
+                    return secret_key
+                else:
+                    raise TypeError("Unknown key derivation method")
+    suggested_label: supports
+    reason: "The final else branch raises TypeError(\"Unknown key derivation method\")."
+    human_label:
+  - id: itsd-10
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "Signer.verify_signature tries the secret keys in reverse list order and accepts the signature if any key matches."
+    evidence:
+      path: src/itsdangerous/signer.py
+      start: 227
+      end: 242
+      text: |2-
+            def verify_signature(self, value: str | bytes, sig: str | bytes) -> bool:
+                """Verifies the signature for the given value."""
+                try:
+                    sig = base64_decode(sig)
+                except Exception:
+                    return False
+
+                value = want_bytes(value)
+
+                for secret_key in reversed(self.secret_keys):
+                    key = self.derive_key(secret_key)
+
+                    if self.algorithm.verify_signature(key, value, sig):
+                        return True
+
+                return False
+    suggested_label: supports
+    reason: "It loops over reversed(self.secret_keys) and returns True on the first match."
+    human_label:
+  - id: itsd-11
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "Signer.unsign raises BadSignature when the separator is missing from the signed value."
+    evidence:
+      path: src/itsdangerous/signer.py
+      start: 244
+      end: 249
+      text: |2-
+            def unsign(self, signed_value: str | bytes) -> bytes:
+                """Unsigns the given string."""
+                signed_value = want_bytes(signed_value)
+
+                if self.sep not in signed_value:
+                    raise BadSignature(f"No {self.sep!r} found in value")
+    suggested_label: supports
+    reason: "If self.sep not in signed_value it raises BadSignature."
+    human_label:
+  - id: itsd-12
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "base64_encode strips the trailing '=' padding from its output."
+    evidence:
+      path: src/itsdangerous/encoding.py
+      start: 20
+      end: 25
+      text: |2-
+        def base64_encode(string: str | bytes) -> bytes:
+            """Base64 encode a string of bytes or text. The resulting bytes are
+            safe to use in URLs.
+            """
+            string = want_bytes(string)
+            return base64.urlsafe_b64encode(string).rstrip(b"=")
+    suggested_label: supports
+    reason: "It returns urlsafe_b64encode(...).rstrip(b\"=\")."
+    human_label:
+  - id: itsd-13
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "base64_decode returns an empty bytes string when the input is not valid base64."
+    evidence:
+      path: src/itsdangerous/encoding.py
+      start: 28
+      end: 38
+      text: |2-
+        def base64_decode(string: str | bytes) -> bytes:
+            """Base64 decode a URL-safe string of bytes or text. The result is
+            bytes.
+            """
+            string = want_bytes(string, encoding="ascii", errors="ignore")
+            string += b"=" * (-len(string) % 4)
+
+            try:
+                return base64.urlsafe_b64decode(string)
+            except (TypeError, ValueError) as e:
+                raise BadData("Invalid base64-encoded data") from e
+    suggested_label: not_supported
+    reason: "Invalid input raises BadData(\"Invalid base64-encoded data\")."
+    human_label:
+  - id: itsd-14
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "Signer rejects separators that are letters, digits, '-', '_' or '='."
+    evidence:
+      path: src/itsdangerous/encoding.py
+      start: 41
+      end: 42
+      text: |2-
+        # The alphabet used by base64.urlsafe_*
+        _base64_alphabet = f"{string.ascii_letters}{string.digits}-_=".encode("ascii")
+    suggested_label: related_not_supporting
+    reason: "Only the alphabet is defined here; the check that rejects separators lives in signer.py."
+    human_label:
+  - id: itsd-15
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "TimestampSigner.unsign raises BadTimeSignature when the timestamp is missing."
+    evidence:
+      path: src/itsdangerous/exc.py
+      start: 36
+      end: 57
+      text: |2-
+        class BadTimeSignature(BadSignature):
+            """Raised if a time-based signature is invalid. This is a subclass
+            of :class:`BadSignature`.
+            """
+
+            def __init__(
+                self,
+                message: str,
+                payload: t.Any | None = None,
+                date_signed: datetime | None = None,
+            ):
+                super().__init__(message, payload)
+
+                #: If the signature expired this exposes the date of when the
+                #: signature was created. This can be helpful in order to
+                #: tell the user how long a link has been gone stale.
+                #:
+                #: .. versionchanged:: 2.0
+                #:     The datetime value is timezone-aware rather than naive.
+                #:
+                #: .. versionadded:: 0.14
+                self.date_signed = date_signed
+    suggested_label: related_not_supporting
+    reason: "This is the exception class definition; where and when it is raised isn't shown."
+    human_label:
+  - id: itsd-16
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "SignatureExpired is a subclass of BadTimeSignature."
+    evidence:
+      path: src/itsdangerous/exc.py
+      start: 60
+      end: 63
+      text: |2-
+        class SignatureExpired(BadTimeSignature):
+            """Raised if a signature timestamp is older than ``max_age``. This
+            is a subclass of :exc:`BadTimeSignature`.
+            """
+    suggested_label: supports
+    reason: "class SignatureExpired(BadTimeSignature)."
+    human_label:
+  - id: itsd-17
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "BadPayload is a subclass of BadSignature."
+    evidence:
+      path: src/itsdangerous/exc.py
+      start: 92
+      end: 106
+      text: |2-
+        class BadPayload(BadData):
+            """Raised if a payload is invalid. This could happen if the payload
+            is loaded despite an invalid signature, or if there is a mismatch
+            between the serializer and deserializer. The original exception
+            that occurred during loading is stored on as :attr:`original_error`.
+
+            .. versionadded:: 0.15
+            """
+
+            def __init__(self, message: str, original_error: Exception | None = None):
+                super().__init__(message)
+
+                #: If available, the error that indicates why the payload was
+                #: not valid. This might be ``None``.
+                self.original_error: Exception | None = original_error
+    suggested_label: not_supported
+    reason: "BadPayload subclasses BadData, not BadSignature."
+    human_label:
+  - id: itsd-18
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "TimestampSigner silently ignores malformed timestamps."
+    evidence:
+      path: src/itsdangerous/timed.py
+      start: 108
+      end: 115
+      text: |2-
+                value, ts_bytes = result.rsplit(sep, 1)
+                ts_int: int | None = None
+                ts_dt: datetime | None = None
+
+                try:
+                    ts_int = bytes_to_int(base64_decode(ts_bytes))
+                except Exception:
+                    pass
+    suggested_label: ambiguous
+    reason: "The excerpt swallows the decode error with 'pass', but lines 134-135 later raise 'Malformed timestamp'."
+    human_label:
+  - id: itsd-19
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "TimestampSigner.unsign raises SignatureExpired when the signature is older than max_age."
+    evidence:
+      path: src/itsdangerous/timed.py
+      start: 137
+      end: 146
+      text: |2-
+                # Check timestamp is not older than max_age
+                if max_age is not None:
+                    age = self.get_timestamp() - ts_int
+
+                    if age > max_age:
+                        raise SignatureExpired(
+                            f"Signature age {age} > {max_age} seconds",
+                            payload=value,
+                            date_signed=self.timestamp_to_datetime(ts_int),
+                        )
+    suggested_label: supports
+    reason: "If age > max_age it raises SignatureExpired."
+    human_label:
+  - id: itsd-20
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "TimedSerializer.loads does not try other signers once a signature has expired."
+    evidence:
+      path: src/itsdangerous/timed.py
+      start: 202
+      end: 220
+      text: |2-
+                for signer in self.iter_unsigners(salt):
+                    try:
+                        base64d, timestamp = signer.unsign(
+                            s, max_age=max_age, return_timestamp=True
+                        )
+                        payload = self.load_payload(base64d)
+
+                        if return_timestamp:
+                            return payload, timestamp
+
+                        return payload
+                    except SignatureExpired:
+                        # The signature was unsigned successfully but was
+                        # expired. Do not try the next signer.
+                        raise
+                    except BadSignature as err:
+                        last_exception = err
+
+                raise t.cast(BadSignature, last_exception)
+    suggested_label: supports
+    reason: "except SignatureExpired: raise, with the comment 'Do not try the next signer'."
+    human_label:
+  - id: itsd-21
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "URLSafeSerializerMixin uses the zlib-compressed payload only when it saves at least two bytes, and marks it with a leading '.'."
+    evidence:
+      path: src/itsdangerous/url_safe.py
+      start: 55
+      end: 69
+      text: |2-
+            def dump_payload(self, obj: t.Any) -> bytes:
+                json = super().dump_payload(obj)
+                is_compressed = False
+                compressed = zlib.compress(json)
+
+                if len(compressed) < (len(json) - 1):
+                    json = compressed
+                    is_compressed = True
+
+                base64d = base64_encode(json)
+
+                if is_compressed:
+                    base64d = b"." + base64d
+
+                return base64d
+    suggested_label: supports
+    reason: "Compressed is used when len(compressed) < len(json) - 1, then b\".\" is prefixed."
+    human_label:
+  - id: itsd-22
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "URLSafeSerializer output contains only letters, '_', '-' and '.'."
+    evidence:
+      path: src/itsdangerous/url_safe.py
+      start: 72
+      end: 76
+      text: |2-
+        class URLSafeSerializer(URLSafeSerializerMixin, Serializer[str]):
+            """Works like :class:`.Serializer` but dumps and loads into a URL
+            safe string consisting of the upper and lowercase character of the
+            alphabet as well as ``'_'``, ``'-'`` and ``'.'``.
+            """
+    suggested_label: ambiguous
+    reason: "The docstring says so, but base64 output also contains digits, which the docstring leaves out."
+    human_label:
+  - id: itsd-23
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "Serializer.dumps returns a str when the internal serializer produces text."
+    evidence:
+      path: src/itsdangerous/serializer.py
+      start: 32
+      end: 37
+      text: |2-
+        # Use TypeIs once it's available in typing_extensions or 3.13.
+        def is_text_serializer(
+            serializer: _PDataSerializer[t.Any],
+        ) -> te.TypeGuard[_PDataSerializer[str]]:
+            """Checks whether a serializer generates text or binary."""
+            return isinstance(serializer.dumps({}), str)
+    suggested_label: related_not_supporting
+    reason: "is_text_serializer only detects text serializers; the decode to str happens in dumps, not shown."
+    human_label:
+  - id: itsd-24
+    repo: pallets/itsdangerous
+    snapshot: "github:pallets/itsdangerous@672971d66a2ef9f85151e53283113f33d642dabd"
+    claim: "Serializer.loads stops at the first signer that fails and raises its error immediately."
+    evidence:
+      path: src/itsdangerous/serializer.py
+      start: 328
+      end: 343
+      text: |2-
+            def loads(
+                self, s: str | bytes, salt: str | bytes | None = None, **kwargs: t.Any
+            ) -> t.Any:
+                """Reverse of :meth:`dumps`. Raises :exc:`.BadSignature` if the
+                signature validation fails.
+                """
+                s = want_bytes(s)
+                last_exception = None
+
+                for signer in self.iter_unsigners(salt):
+                    try:
+                        return self.load_payload(signer.unsign(s))
+                    except BadSignature as err:
+                        last_exception = err
+
+                raise t.cast(BadSignature, last_exception)
+    suggested_label: not_supported
+    reason: "It records the error and tries the next signer, raising the last exception only after all fail."
+    human_label:
+  - id: msafe-01
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "The pure-Python _escape_inner replaces &, >, <, single quote and double quote with HTML entities."
+    evidence:
+      path: src/markupsafe/_native.py
+      start: 1
+      end: 8
+      text: |2-
+        def _escape_inner(s: str, /) -> str:
+            return (
+                s.replace("&", "&amp;")
+                .replace(">", "&gt;")
+                .replace("<", "&lt;")
+                .replace("'", "&#39;")
+                .replace('"', "&#34;")
+            )
+    suggested_label: supports
+    reason: "Five chained replace calls cover exactly those characters."
+    human_label:
+  - id: msafe-02
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "_escape_inner escapes single quotes as &apos;."
+    evidence:
+      path: src/markupsafe/_native.py
+      start: 1
+      end: 8
+      text: |2-
+        def _escape_inner(s: str, /) -> str:
+            return (
+                s.replace("&", "&amp;")
+                .replace(">", "&gt;")
+                .replace("<", "&lt;")
+                .replace("'", "&#39;")
+                .replace('"', "&#34;")
+            )
+    suggested_label: not_supported
+    reason: "Single quotes become &#39;, not &apos;."
+    human_label:
+  - id: msafe-03
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "The C speedups module escapes the same five characters as the pure-Python version."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 7
+      end: 10
+      text: |2-
+        try:
+            from ._speedups import _escape_inner
+        except ImportError:
+            from ._native import _escape_inner
+    suggested_label: related_not_supporting
+    reason: "Only the import with a fallback is shown; the speedups module's behaviour isn't."
+    human_label:
+  - id: msafe-04
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "escape returns the output of an object's __html__ method without escaping it, when the object defines one."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 39
+      end: 45
+      text: |2-
+            if type(s) is str:
+                return Markup(_escape_inner(s))
+
+            if hasattr(s, "__html__"):
+                return Markup(s.__html__())
+
+            return Markup(_escape_inner(str(s)))
+    suggested_label: supports
+    reason: "If hasattr(s, \"__html__\") it returns Markup(s.__html__()) without calling _escape_inner."
+    human_label:
+  - id: msafe-05
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "escape_silent returns an empty Markup for None."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 58
+      end: 61
+      text: |2-
+            if s is None:
+                return Markup()
+
+            return escape(s)
+    suggested_label: supports
+    reason: "if s is None: return Markup()."
+    human_label:
+  - id: msafe-06
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "soft_str converts Markup objects back to plain str."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 64
+      end: 81
+      text: |2-
+        def soft_str(s: t.Any, /) -> str:
+            """Convert an object to a string if it isn't already. This preserves
+            a :class:`Markup` string rather than converting it back to a basic
+            string, so it will still be marked as safe and won't be escaped
+            again.
+
+            >>> value = escape("<User 1>")
+            >>> value
+            Markup('&lt;User 1&gt;')
+            >>> escape(str(value))
+            Markup('&amp;lt;User 1&amp;gt;')
+            >>> escape(soft_str(value))
+            Markup('&lt;User 1&gt;')
+            """
+            if not isinstance(s, str):
+                return str(s)
+
+            return s
+    suggested_label: not_supported
+    reason: "Markup is a str subclass, so it is returned unchanged; the docstring says it preserves Markup."
+    human_label:
+  - id: msafe-07
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "Markup protects against cross-site scripting (XSS)."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 84
+      end: 91
+      text: |2-
+        class Markup(str):
+            """A string that is ready to be safely inserted into an HTML or XML
+            document, either because it was escaped or because it was marked
+            safe.
+
+            Passing an object to the constructor converts it to text and wraps
+            it to mark it safe without escaping. To escape the text, use the
+            :meth:`escape` class method instead.
+    suggested_label: ambiguous
+    reason: "Escaped Markup is safe, but the constructor marks any text safe without escaping, so it depends on use."
+    human_label:
+  - id: msafe-08
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "Markup.__add__ escapes the other operand before concatenating."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 136
+      end: 140
+      text: |2-
+            def __add__(self, value: str | _HasHTML, /) -> te.Self:
+                if isinstance(value, str) or hasattr(value, "__html__"):
+                    return self.__class__(super().__add__(self.escape(value)))
+
+                return NotImplemented
+    suggested_label: supports
+    reason: "It concatenates self.escape(value)."
+    human_label:
+  - id: msafe-09
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "Multiplying a Markup string escapes its contents."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 148
+      end: 152
+      text: |2-
+            def __mul__(self, value: t.SupportsIndex, /) -> te.Self:
+                return self.__class__(super().__mul__(value))
+
+            def __rmul__(self, value: t.SupportsIndex, /) -> te.Self:
+                return self.__class__(super().__mul__(value))
+    suggested_label: not_supported
+    reason: "__mul__ only wraps super().__mul__(value) in Markup; nothing is escaped."
+    human_label:
+  - id: msafe-10
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "Markup.unescape returns a Markup object."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 188
+      end: 197
+      text: |2-
+            def unescape(self, /) -> str:
+                """Convert escaped markup back into a text string. This replaces
+                HTML entities with the characters they represent.
+
+                >>> Markup("Main &raquo; <em>About</em>").unescape()
+                'Main » <em>About</em>'
+                """
+                from html import unescape
+
+                return unescape(str(self))
+    suggested_label: not_supported
+    reason: "It is annotated -> str and returns html.unescape(str(self)), a plain str."
+    human_label:
+  - id: msafe-11
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "Markup.striptags removes every HTML tag from the string."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 199
+      end: 238
+      text: |2-
+            def striptags(self, /) -> str:
+                """:meth:`unescape` the markup, remove tags, and normalize
+                whitespace to single spaces.
+
+                >>> Markup("Main &raquo;\t<em>About</em>").striptags()
+                'Main » About'
+                """
+                value = str(self)
+                parts = []
+                pos = 0
+
+                while (start := value.find("<", pos)) != -1:
+                    if value.startswith("<!--", start):
+                        # comment
+                        if (end := value.find("-->", start + 4)) == -1:
+                            # unclosed
+                            break
+
+                        end += 3
+                    else:
+                        # tag
+                        if (end := value.find(">", start)) == -1:
+                            # unclosed
+                            break
+
+                        end += 1
+
+                    parts.append(value[pos:start])
+                    pos = end
+
+                # found at least one tag, combine parts
+                if pos > 0:
+                    # any trailing data after the last closed tag
+                    parts.append(value[pos:])
+                    value = "".join(parts)
+
+                # collapse spaces
+                value = " ".join(value.split())
+                # unescape the processed value using the current class
+                return self.__class__(value).unescape()
+    suggested_label: ambiguous
+    reason: "Well-formed tags and comments are removed, but the loop stops at an unclosed tag and keeps the rest."
+    human_label:
+  - id: msafe-12
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "Markup.escape escapes the characters &, <, >, ' and \"."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 240
+      end: 250
+      text: |2-
+            @classmethod
+            def escape(cls, s: t.Any, /) -> te.Self:
+                """Escape a string. Calls :func:`escape` and ensures that for
+                subclasses the correct type is returned.
+                """
+                rv = escape(s)
+
+                if rv.__class__ is not cls:
+                    return cls(rv)
+
+                return rv
+    suggested_label: related_not_supporting
+    reason: "It delegates to escape(s); which characters are escaped isn't visible here."
+    human_label:
+  - id: msafe-13
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "Markup.__html_format__ raises ValueError when a format specification is given."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 335
+      end: 339
+      text: |2-
+            def __html_format__(self, format_spec: str, /) -> te.Self:
+                if format_spec:
+                    raise ValueError("Unsupported format specification for Markup.")
+
+                return self
+    suggested_label: supports
+    reason: "if format_spec: raise ValueError(...)."
+    human_label:
+  - id: msafe-14
+    repo: pallets/markupsafe
+    snapshot: "github:pallets/markupsafe@4e111271b1494995708a9e878a10829b5e10c7ba"
+    claim: "Markup.format escapes every positional argument."
+    evidence:
+      path: src/markupsafe/__init__.py
+      start: 342
+      end: 364
+      text: |2-
+        class EscapeFormatter(string.Formatter):
+            __slots__ = ("escape",)
+
+            def __init__(self, escape: _TPEscape) -> None:
+                self.escape: _TPEscape = escape
+                super().__init__()
+
+            def format_field(self, value: t.Any, format_spec: str) -> str:
+                if hasattr(value, "__html_format__"):
+                    rv = value.__html_format__(format_spec)
+                elif hasattr(value, "__html__"):
+                    if format_spec:
+                        raise ValueError(
+                            f"Format specifier {format_spec} given, but {type(value)} does not"
+                            " define __html_format__. A class that defines __html__ must define"
+                            " __html_format__ to work with format specifiers."
+                        )
+                    rv = value.__html__()
+                else:
+                    # We need to make sure the format spec is str here as
+                    # otherwise the wrong callback methods are invoked.
+                    rv = super().format_field(value, str(format_spec))
+                return str(self.escape(rv))
+    suggested_label: related_not_supporting
+    reason: "EscapeFormatter.format_field escapes values, but this excerpt doesn't show Markup.format using it."
+    human_label:
+  - id: mlp-01
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "DataIngestion.load_data raises FileNotFoundError when the dataset path does not exist."
+    evidence:
+      path: house-prediction-system/src/data_ingestion.py
+      start: 11
+      end: 19
+      text: |2-
+            def load_data(self) -> pd.DataFrame:
+
+                if not self.data_path.exists():
+                    raise FileNotFoundError(
+                        f"Dataset not found: {self.data_path}"
+                    )
+
+                df = pd.read_csv(self.data_path)
+                return df
+    suggested_label: supports
+    reason: "If not self.data_path.exists() it raises FileNotFoundError."
+    human_label:
+  - id: mlp-02
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "The training scripts load the Ames dataset through DataIngestion."
+    evidence:
+      path: house-prediction-system/src/data_ingestion.py
+      start: 21
+      end: 25
+      text: |2-
+        if __name__ == "__main__":
+
+            ingestion = DataIngestion("data/raw/AmesHousing.csv")
+
+            df = ingestion.load_data()
+    suggested_label: related_not_supporting
+    reason: "This is data_ingestion.py's own __main__ block; train.py reads the CSV with pd.read_csv instead."
+    human_label:
+  - id: mlp-03
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "validate_data removes duplicate rows from the dataset."
+    evidence:
+      path: house-prediction-system/src/data_validation.py
+      start: 27
+      end: 30
+      text: |2-
+            # 4. Check duplicate rows
+            duplicates = df.duplicated().sum()
+
+            print(f"\nDuplicate rows: {duplicates}")
+    suggested_label: not_supported
+    reason: "It only counts duplicates with df.duplicated().sum() and prints the number."
+    human_label:
+  - id: mlp-04
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "validate_data fails when the dataset has missing values."
+    evidence:
+      path: house-prediction-system/src/data_validation.py
+      start: 32
+      end: 39
+      text: |2-
+            # 5. Check missing values
+            missing_values = df.isnull().sum()
+
+            missing_values = missing_values[missing_values > 0
+            ].sort_values(ascending=False)
+
+            print("\nMissing values:")
+            print(missing_values)
+    suggested_label: ambiguous
+    reason: "The excerpt only prints missing values; whether it fails depends on the return later (it returns True)."
+    human_label:
+  - id: mlp-05
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "build_preprocessor treats 'MS SubClass' as a categorical feature when the column is present."
+    evidence:
+      path: house-prediction-system/src/preprocessing.py
+      start: 11
+      end: 18
+      text: |2-
+            # MS SubClass is numeric in the dataset,
+            # but semantically it represents a category.
+            categorical_features = X.select_dtypes(
+                include=["object", "str"]
+            ).columns.tolist()
+
+            if "MS SubClass" in X.columns:
+                categorical_features.append("MS SubClass")
+    suggested_label: supports
+    reason: "It appends \"MS SubClass\" to categorical_features if the column exists."
+    human_label:
+  - id: mlp-06
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "build_preprocessor detects every text column as categorical."
+    evidence:
+      path: house-prediction-system/src/preprocessing.py
+      start: 13
+      end: 15
+      text: |2-
+            categorical_features = X.select_dtypes(
+                include=["object", "str"]
+            ).columns.tolist()
+    suggested_label: ambiguous
+    reason: "It selects dtypes 'object' and 'str'; which columns match depends on the pandas version and dtypes."
+    human_label:
+  - id: mlp-07
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "Categorical features are imputed with the most frequent value and one-hot encoded, ignoring unknown categories."
+    evidence:
+      path: house-prediction-system/src/preprocessing.py
+      start: 34
+      end: 48
+      text: |2-
+            categorical_pipeline = Pipeline(
+                steps=[
+                    (
+                        "imputer",
+                        SimpleImputer(strategy="most_frequent")
+                    ),
+                    (
+                        "encoder",
+                        OneHotEncoder(
+                            handle_unknown="ignore",
+                            sparse_output=False
+                        )
+                    )
+                ]
+            )
+    suggested_label: supports
+    reason: "SimpleImputer(strategy=\"most_frequent\") then OneHotEncoder(handle_unknown=\"ignore\")."
+    human_label:
+  - id: mlp-08
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "create_features keeps the Order and PID columns."
+    evidence:
+      path: house-prediction-system/src/feature_engineering.py
+      start: 11
+      end: 17
+      text: |2-
+            df = df.copy()
+
+            # Remove identification columns
+            df = df.drop(
+                columns=["Order", "PID"],
+                errors="ignore"
+            )
+    suggested_label: not_supported
+    reason: "They are dropped with df.drop(columns=[\"Order\", \"PID\"])."
+    human_label:
+  - id: mlp-09
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "TotalBathrooms counts half bathrooms as 0.5."
+    evidence:
+      path: house-prediction-system/src/feature_engineering.py
+      start: 29
+      end: 34
+      text: |2-
+            df["TotalBathrooms"] = (
+                df["Full Bath"]
+                + 0.5 * df["Half Bath"]
+                + df["Bsmt Full Bath"]
+                + 0.5 * df["Bsmt Half Bath"]
+            )
+    suggested_label: supports
+    reason: "Half Bath and Bsmt Half Bath are multiplied by 0.5."
+    human_label:
+  - id: mlp-10
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "HouseAge is clipped so it is never negative."
+    evidence:
+      path: house-prediction-system/src/feature_engineering.py
+      start: 53
+      end: 55
+      text: |2-
+            df["HouseAge"] = (
+                df["Yr Sold"] - df["Year Built"]
+            ).clip(lower=0)
+    suggested_label: supports
+    reason: ".clip(lower=0) is applied to Yr Sold - Year Built."
+    human_label:
+  - id: mlp-11
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "GarageAge is always a valid number."
+    evidence:
+      path: house-prediction-system/src/feature_engineering.py
+      start: 61
+      end: 63
+      text: |2-
+            df["GarageAge"] = (
+                df["Yr Sold"] - df["Garage Yr Blt"]
+            ).clip(lower=0)
+    suggested_label: ambiguous
+    reason: "It is clipped at 0, but a missing Garage Yr Blt (no garage) would still give NaN."
+    human_label:
+  - id: mlp-12
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "train.py trains on the log of SalePrice."
+    evidence:
+      path: house-prediction-system/src/train.py
+      start: 49
+      end: 55
+      text: |2-
+        # -----------------------------
+        # Target
+        # -----------------------------
+
+        y = np.log1p(df["SalePrice"])
+
+        X = df.drop(columns=["SalePrice"])
+    suggested_label: supports
+    reason: "y = np.log1p(df[\"SalePrice\"])."
+    human_label:
+  - id: mlp-13
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "The model is a random forest with 500 trees."
+    evidence:
+      path: house-prediction-system/src/train.py
+      start: 85
+      end: 98
+      text: |2-
+        # -----------------------------
+        # XGBoost
+        # -----------------------------
+
+        model = XGBRegressor(
+            objective="reg:squarederror",
+            n_estimators=1200,
+            learning_rate=0.03,
+            max_depth=4,
+            min_child_weight=3,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=RANDOM_STATE
+        )
+    suggested_label: not_supported
+    reason: "It is an XGBRegressor with n_estimators=1200."
+    human_label:
+  - id: mlp-14
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "The model's quality is reported in dollars."
+    evidence:
+      path: house-prediction-system/src/train.py
+      start: 136
+      end: 162
+      text: |2-
+        # -----------------------------
+        # Evaluation
+        # -----------------------------
+
+        mae = mean_absolute_error(
+            y_test_original,
+            y_pred_original
+        )
+
+        rmse = np.sqrt(
+            mean_squared_error(
+                y_test_original,
+                y_pred_original
+            )
+        )
+
+        r2 = r2_score(
+            y_test_original,
+            y_pred_original
+        )
+
+
+        print("\n========== MODEL PERFORMANCE ==========")
+
+        print(f"MAE  : ${mae:,.2f}")
+        print(f"RMSE : ${rmse:,.2f}")
+        print(f"R²   : {r2:.4f}")
+    suggested_label: ambiguous
+    reason: "MAE and RMSE are in dollars, but R² is unitless."
+    human_label:
+  - id: mlp-15
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "train_app_model.py uses predict_price to evaluate the model on the test set."
+    evidence:
+      path: house-prediction-system/src/train_app_model.py
+      start: 12
+      end: 13
+      text: |2-
+        from src.preprocessing import build_preprocessor
+        from src.predict import predict_price
+    suggested_label: related_not_supporting
+    reason: "predict_price is imported, but these lines don't show it used; evaluation uses pipeline.predict."
+    human_label:
+  - id: mlp-16
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "The application model uses 25 input features."
+    evidence:
+      path: house-prediction-system/src/train_app_model.py
+      start: 22
+      end: 42
+      text: |2-
+        APP_FEATURES = [
+            "Overall Qual",
+            "Overall Cond",
+            "Gr Liv Area",
+            "1st Flr SF",
+            "2nd Flr SF",
+            "Total Bsmt SF",
+            "Garage Cars",
+            "Garage Area",
+            "Full Bath",
+            "Half Bath",
+            "Bedroom AbvGr",
+            "TotRms AbvGrd",
+            "Year Built",
+            "Year Remod/Add",
+            "Neighborhood",
+            "Kitchen Qual",
+            "Exter Qual",
+            "Lot Area",
+            "Fireplaces"
+        ]
+    suggested_label: not_supported
+    reason: "APP_FEATURES lists 19 features."
+    human_label:
+  - id: mlp-17
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "predict_price returns the prediction in log scale."
+    evidence:
+      path: house-prediction-system/src/predict.py
+      start: 44
+      end: 55
+      text: |2-
+        def predict_price(house_data: pd.DataFrame) -> float:
+            """
+            Predict house price form application features.
+            """
+
+            # Make prediction in log scale
+            prediction_log = model.predict(house_data)
+
+            # Convert log prediction back to original dollar scale
+            prediction = np.expm1(prediction_log)
+
+            return float(prediction[0])
+    suggested_label: not_supported
+    reason: "It converts back with np.expm1 before returning."
+    human_label:
+  - id: mlp-18
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "The API loads the model from models/house_price_xgb.joblib."
+    evidence:
+      path: house-prediction-system/src/api.py
+      start: 19
+      end: 25
+      text: |2-
+        # --------------------------------
+        # Load application model
+        # --------------------------------
+
+        MODEL_PATH = "models/house_price_app_xgb.joblib"
+
+        model = joblib.load(MODEL_PATH)
+    suggested_label: not_supported
+    reason: "MODEL_PATH is models/house_price_app_xgb.joblib, a different file."
+    human_label:
+  - id: mlp-19
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "The /health endpoint reports the model as 'XGBoost Application Model'."
+    evidence:
+      path: house-prediction-system/src/api.py
+      start: 66
+      end: 72
+      text: |2-
+        @app.get("/health")
+        def health_check():
+
+            return {
+                "status": "healthy",
+                "model": "XGBoost Application Model"
+            }
+    suggested_label: supports
+    reason: "health_check returns model: \"XGBoost Application Model\"."
+    human_label:
+  - id: mlp-20
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "The API's input fields match the features the application model was trained on."
+    evidence:
+      path: house-prediction-system/src/api.py
+      start: 84
+      end: 112
+      text: |2-
+            # Convert API names → dataset names
+            data = {
+                "Overall Qual": data["overall_qual"],
+                "Overall Cond": data["overall_cond"],
+
+                "Gr Liv Area": data["gr_liv_area"],
+                "1st Flr SF": data["first_flr_sf"],
+                "2nd Flr SF": data["second_flr_sf"],
+                "Total Bsmt SF": data["total_bsmt_sf"],
+
+                "Garage Cars": data["garage_cars"],
+                "Garage Area": data["garage_area"],
+
+                "Full Bath": data["full_bath"],
+                "Half Bath": data["half_bath"],
+
+                "Bedroom AbvGr": data["bedroom_abvgr"],
+                "TotRms AbvGrd": data["tot_rms_abvgrd"],
+
+                "Year Built": data["year_built"],
+                "Year Remod/Add": data["year_remod_add"],
+
+                "Neighborhood": data["neighborhood"],
+                "Kitchen Qual": data["kitchen_qual"],
+                "Exter Qual": data["exter_qual"],
+
+                "Lot Area": data["lot_area"],
+                "Fireplaces": data["fireplaces"]
+            }
+    suggested_label: ambiguous
+    reason: "It maps 19 names to dataset columns; confirming they match needs APP_FEATURES in train_app_model.py."
+    human_label:
+  - id: mlp-21
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "The API converts the model's log-scale prediction back to dollars with expm1."
+    evidence:
+      path: house-prediction-system/src/api.py
+      start: 117
+      end: 121
+      text: |2-
+            # Predict log(price)
+            prediction_log = model.predict(house_df)
+
+            # Convert log(price) → actual price
+            predicted_price = np.expm1(prediction_log[0])
+    suggested_label: supports
+    reason: "predicted_price = np.expm1(prediction_log[0])."
+    human_label:
+  - id: mlp-22
+    repo: kashu9313161/ML-Projects
+    snapshot: "github:kashu9313161/ML-Projects@eeac1e6ec12bf0415c95fa2d6942ea40889228bf"
+    claim: "create_features is tested for the HouseAge value."
+    evidence:
+      path: house-prediction-system/tests/test_features.py
+      start: 50
+      end: 53
+      text: |2-
+            assert result["TotalSF"].iloc[0] == 2700
+            assert result["TotalBathrooms"].iloc[0] == 3.5
+            assert result["TotalPorchSF"].iloc[0] == 180
+            assert result["TotalBsmtFinSF"].iloc[0] == 600
+    suggested_label: related_not_supporting
+    reason: "These assertions check TotalSF, bathrooms, porch and basement values; HouseAge's value isn't checked."
+    human_label:

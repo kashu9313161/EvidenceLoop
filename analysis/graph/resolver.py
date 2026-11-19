@@ -21,8 +21,14 @@ from pathlib import PurePosixPath
 from analysis.javascript.shallow import blank_comments
 
 PY_SUFFIXES = (".py", ".pyi")
-JS_PROBE = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts",
+JS_PROBE = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".d.ts",
             "/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs")
+# TypeScript's ESM convention: `import "./util.js"` names the file that compiles to util.js,
+# which in the repository is util.ts (or .tsx, .mts, .cts).
+TS_SOURCES_FOR = {".js": (".ts", ".tsx", ".d.ts"), ".jsx": (".tsx",), ".mjs": (".mts",),
+                  ".cjs": (".cts",)}
+# Where a repository keeps the source of its own package, most common first.
+OWN_SOURCE_DIRS = ("src", "source", "", "lib")
 ASSET_SUFFIXES = {".css", ".scss", ".sass", ".less", ".svg", ".png", ".jpg", ".jpeg", ".gif",
                   ".webp", ".ico", ".woff", ".woff2", ".ttf", ".json", ".md", ".html", ".wasm"}
 # Plus modules newer than the running Python (3.14 added these), so code written for a newer
@@ -204,9 +210,11 @@ class JsResolver:
                 continue
             rest = specifier[len(name):].lstrip("/")
             prefix = f"{directory}/" if directory else ""
-            bases = ([f"{prefix}src/{rest}", f"{prefix}{rest}", f"{prefix}lib/{rest}"] if rest
-                     else [f"{prefix}src/index", f"{prefix}index", f"{prefix}lib/index",
-                           f"{prefix}src/{PurePosixPath(name).name}"])
+            folders = [f"{prefix}{d}/" if d else prefix for d in OWN_SOURCE_DIRS]
+            short = PurePosixPath(name).name
+            bases = ([f"{f}{rest}" for f in folders] if rest
+                     else [f"{f}index" for f in folders]
+                     + [f"{prefix}src/{short}", f"{prefix}source/{short}"])
             for base in bases:
                 found = self._probe(base)
                 if found:
@@ -215,9 +223,16 @@ class JsResolver:
 
     def _probe(self, base: str) -> str | None:
         for suffix in JS_PROBE:
-            candidate = base + suffix
-            if candidate in self.files:
+            # The repository root itself (`require("..")` from a top-level folder): its
+            # index file is "index.js", not "/index.js".
+            candidate = base + suffix if base else suffix.lstrip("/")
+            if candidate and candidate in self.files:
                 return candidate
+        stem, dot, extension = base.rpartition(".")
+        if dot and "/" not in extension:
+            for source in TS_SOURCES_FOR.get(f".{extension.lower()}", ()):
+                if stem + source in self.files:
+                    return stem + source
         return None
 
     @staticmethod
@@ -271,7 +286,7 @@ def _loads_jsonc(text: str):
     cleaned = re.sub(r",(\s*[}\]])", r"\1", blank_comments(text))
     try:
         return json.loads(cleaned)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError, MemoryError):  # bad JSON, or nested to crash the parser
         return None
 
 
@@ -304,7 +319,7 @@ def package_names(manifests: dict[str, str]) -> dict[str, str]:
     for path, text in manifests.items():
         try:
             data = json.loads(text)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError, MemoryError):  # unreadable: skip, don't fail
             continue
         name = data.get("name") if isinstance(data, dict) else None
         if isinstance(name, str) and re.fullmatch(r"(@[\w.-]+/)?[\w.-]+", name):

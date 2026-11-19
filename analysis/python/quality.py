@@ -193,6 +193,53 @@ def _is_empty_handler(handler: ast.ExceptHandler) -> bool:
     )
 
 
+def _deliberate_fallbacks(tree: ast.AST) -> set[int]:
+    """Handlers of `try` blocks that only assign variables the code reads afterwards, e.g.
+
+        try:
+            ts = parse(raw)
+        except Exception:
+            pass
+        ...
+        if ts is None: raise ...
+
+    The failure isn't swallowed: it leaves the variable at its fallback, and the code checks it.
+    Returns the ids of those handlers."""
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    found: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or not node.handlers:
+            continue
+        assigned: set[str] = set()
+        for statement in node.body:
+            if isinstance(statement, ast.Assign):
+                targets = statement.targets
+            elif isinstance(statement, ast.AnnAssign | ast.AugAssign):
+                targets = [statement.target]
+            else:
+                assigned = set()
+                break
+            if not all(isinstance(t, ast.Name) for t in targets):
+                assigned = set()
+                break
+            assigned.update(t.id for t in targets if isinstance(t, ast.Name))
+        if not assigned:
+            continue
+        scope = parents.get(node)
+        while scope is not None and not isinstance(
+                scope, ast.FunctionDef | ast.AsyncFunctionDef | ast.Module):
+            scope = parents.get(scope)
+        end = node.end_lineno or node.lineno
+        if scope is not None and any(
+                isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in assigned
+                and n.lineno > end for n in ast.walk(scope)):
+            found.update(id(handler) for handler in node.handlers)
+    return found
+
+
 def _too_broad(handler: ast.ExceptHandler) -> bool:
     if handler.type is None:
         return True
@@ -203,6 +250,7 @@ def _too_broad(handler: ast.ExceptHandler) -> bool:
 def analyze_python(source: str, lines: list[str] | None = None) -> PythonQuality:
     """Parse once and collect every quality fact. Raises SyntaxError on bad source."""
     tree = ast.parse(source)
+    fallbacks = _deliberate_fallbacks(tree)
     lines = lines if lines is not None else source.splitlines()
     quality = PythonQuality(total_lines=len(lines))
     quality.loc = sum(
@@ -291,7 +339,8 @@ def analyze_python(source: str, lines: list[str] | None = None) -> PythonQuality
                     quality.model_classes += 1
                 visit(child, f"{qualified}.", True)
             else:
-                if isinstance(child, ast.ExceptHandler) and _too_broad(child):
+                if isinstance(child, ast.ExceptHandler) and _too_broad(child) \
+                        and id(child) not in fallbacks:
                     if _is_empty_handler(child):
                         quality.smells.append(
                             Smell("swallowed_exception", child.lineno,

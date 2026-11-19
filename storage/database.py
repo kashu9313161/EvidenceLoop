@@ -482,6 +482,16 @@ def list_imports(snapshot_id: str, relative_path: str | None = None) -> list[sql
         return connection.execute(query, params).fetchall()
 
 
+LIKE_ESCAPE = "\\"
+
+
+def like_literal(text: str) -> str:
+    """Text for a LIKE pattern, matched as written: `%` and `_` in user input are not wildcards.
+    Use with `LIKE ? ESCAPE '\\'`."""
+    return (text.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2).replace("%", LIKE_ESCAPE + "%")
+            .replace("_", LIKE_ESCAPE + "_"))
+
+
 def search_symbols(snapshot_id: str, text: str, limit: int = 50) -> list[sqlite3.Row]:
     """Full-text search over symbol names, paths and source text."""
     terms = [term for term in text.replace('"', " ").split() if term]

@@ -7,7 +7,7 @@ import { Rich } from './bits'
 const known = new Map<string, Explanation>()
 
 type View =
-  | { key: string; phase: 'facts' }
+  | { key: string; phase: 'facts'; aiOff?: boolean }
   | { key: string; phase: 'writing' }
   | { key: string; phase: 'error'; error: string }
 
@@ -67,7 +67,7 @@ function useExplanation(snapshotId: string, path: string, mayWrite: boolean) {
         } else if (step === 'write') {
           write(false)
         } else {
-          setView({ key, phase: 'facts' })
+          setView({ key, phase: 'facts', aiOff: !res.available })
         }
       })
       .catch(() => { if (!cancelled) setView({ key, phase: 'facts' }) })
@@ -80,6 +80,7 @@ function useExplanation(snapshotId: string, path: string, mayWrite: boolean) {
     explanation: writing ? undefined : known.get(key),
     writing,
     error: current?.phase === 'error' ? current.error : null,
+    aiOff: current?.phase === 'facts' && !!current.aiOff,
     regenerate: () => { known.delete(key); write(true) },
     retry: () => write(false),
   }
@@ -88,7 +89,7 @@ function useExplanation(snapshotId: string, path: string, mayWrite: boolean) {
 /** "What is this file?": an AI-written paragraph and where to start reading, over the
  * deterministic description. Without an API key only the description shows. */
 export function FileExplanation({ snapshotId, file, onOpenLine, collapsible = false }: Props) {
-  const { explanation, writing, error, regenerate, retry } = useExplanation(snapshotId, file.path, true)
+  const { explanation, writing, error, aiOff, regenerate, retry } = useExplanation(snapshotId, file.path, true)
   const [folded, setFolded] = useState(() => collapsible && readFolded())
   const fold = (next: boolean) => {
     setFolded(next)
@@ -156,6 +157,12 @@ export function FileExplanation({ snapshotId, file, onOpenLine, collapsible = fa
         </p>
       )}
       <p className={explanation ? 'explain-facts' : undefined}><Rich text={file.description} /></p>
+      {aiOff && collapsible && (
+        <p className="explain-hint">
+          Want a plain-English summary of each file? Set <code>GEMINI_API_KEY</code> in the terminal,
+          then restart EvidenceLoop.
+        </p>
+      )}
     </div>
   )
 }

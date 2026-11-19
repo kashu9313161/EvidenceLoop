@@ -14,39 +14,55 @@ interface Props {
   onOpenIssue: (id: string) => void
 }
 
+/** A row in the tree: analysed code, or a text file (README, docs, config) shown as text. */
+type TreeFile = Pick<FileInfo, 'path' | 'name' | 'status' | 'role_label' | 'role_reason' | 'severity'> & {
+  text?: boolean
+}
+
 interface Folder {
   name: string
   path: string
   folders: Map<string, Folder>
-  files: FileInfo[]
+  files: TreeFile[]
+  hasCode: boolean
 }
 
-function buildTree(files: FileInfo[]): Folder {
-  const root: Folder = { name: '', path: '', folders: new Map(), files: [] }
+function buildTree(files: TreeFile[]): Folder {
+  const root: Folder = { name: '', path: '', folders: new Map(), files: [], hasCode: false }
   for (const file of files) {
     const parts = file.path.split('/')
     let node = root
+    if (!file.text) root.hasCode = true
     parts.slice(0, -1).forEach((part, index) => {
       if (!node.folders.has(part)) {
         node.folders.set(part, {
-          name: part, path: parts.slice(0, index + 1).join('/'), folders: new Map(), files: [],
+          name: part, path: parts.slice(0, index + 1).join('/'), folders: new Map(), files: [], hasCode: false,
         })
       }
       node = node.folders.get(part)!
+      if (!file.text) node.hasCode = true
     })
     node.files.push(file)
   }
   return root
 }
 
+const textFile = (path: string): TreeFile => ({
+  path, name: path.split('/').pop() ?? path, status: 'indexed', role_label: 'Text',
+  role_reason: 'not analysed code; shown as text and included in search', severity: null, text: true,
+})
+
 const SEVERITY_COLOUR = { high: 'var(--signal)', medium: 'var(--amber)', low: 'var(--low)' }
 
-function TreeFolder({ folder, selected, onOpen, closed, toggle }: {
+/** Folders with code start open and text-only folders (docs) start closed; a click flips that.
+ * While filtering, every folder is open. */
+function TreeFolder({ folder, selected, onOpen, toggled, toggle, filtering }: {
   folder: Folder
   selected: string | null
   onOpen: (path: string) => void
-  closed: Set<string>
+  toggled: Set<string>
   toggle: (path: string) => void
+  filtering: boolean
 }) {
   const folders = [...folder.folders.values()].sort((a, b) => a.name.localeCompare(b.name))
   const files = [...folder.files].sort((a, b) => a.name.localeCompare(b.name))
@@ -60,14 +76,15 @@ function TreeFolder({ folder, selected, onOpen, closed, toggle }: {
           shown = [...shown.folders.values()][0]
           label += `/${shown.name}`
         }
-        const isClosed = closed.has(shown.path)
+        const isClosed = !filtering && (shown.hasCode ? toggled.has(shown.path) : !toggled.has(shown.path))
         return (
           <li key={shown.path}>
             <button className="folder" onClick={() => toggle(shown.path)} aria-expanded={!isClosed}>
               <span aria-hidden="true">{isClosed ? '▸' : '▾'}</span> {label}
             </button>
             {!isClosed && (
-              <TreeFolder folder={shown} selected={selected} onOpen={onOpen} closed={closed} toggle={toggle} />
+              <TreeFolder folder={shown} selected={selected} onOpen={onOpen} toggled={toggled} toggle={toggle}
+                filtering={filtering} />
             )}
           </li>
         )
@@ -75,7 +92,7 @@ function TreeFolder({ folder, selected, onOpen, closed, toggle }: {
       {files.map((file) => (
         <li key={file.path}>
           <button
-            className={`file ${selected === file.path ? 'selected' : ''} ${file.status === 'failed' ? 'muted' : ''}`}
+            className={`file ${selected === file.path ? 'selected' : ''} ${file.status === 'failed' ? 'muted' : ''} ${file.text ? 'text' : ''}`}
             onClick={() => onOpen(file.path)}
             aria-current={selected === file.path ? 'true' : undefined}
             title={`${file.role_label}: ${file.role_reason}`}
@@ -94,15 +111,15 @@ function TreeFolder({ folder, selected, onOpen, closed, toggle }: {
 
 export function Files({ report, path, line, onOpen, onOpenIssue }: Props) {
   const [filter, setFilter] = useState('')
-  const [closed, setClosed] = useState<Set<string>>(new Set())
+  const [toggled, setToggled] = useState<Set<string>>(new Set())
   const [detail, setDetail] = useState<FileDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [range, setRange] = useState<[number, number] | null>(null)
 
-  const files = useMemo(
-    () => report.files.filter((f) => !filter || f.path.toLowerCase().includes(filter.toLowerCase())),
-    [report, filter],
-  )
+  const files = useMemo(() => {
+    const all: TreeFile[] = [...report.files, ...(report.coverage.indexed_files ?? []).map(textFile)]
+    return all.filter((f) => !filter || f.path.toLowerCase().includes(filter.toLowerCase()))
+  }, [report, filter])
   const tree = useMemo(() => buildTree(files), [files])
   const selectedPath = path ?? report.summary.key_files[0]?.path ?? report.files[0]?.path ?? null
   const info = report.files.find((f) => f.path === selectedPath) ?? null
@@ -126,7 +143,7 @@ export function Files({ report, path, line, onOpen, onOpenIssue }: Props) {
     }
   }, [line, info])
 
-  const toggle = (p: string) => setClosed((prev) => {
+  const toggle = (p: string) => setToggled((prev) => {
     const next = new Set(prev)
     if (next.has(p)) next.delete(p)
     else next.add(p)
@@ -141,7 +158,8 @@ export function Files({ report, path, line, onOpen, onOpenIssue }: Props) {
       <nav className="tree" aria-label="Files">
         <input className="tree-filter" type="search" placeholder="Filter files" value={filter}
           onChange={(e) => setFilter(e.target.value)} aria-label="Filter files" />
-        <TreeFolder folder={tree} selected={selectedPath} onOpen={(p) => onOpen(p)} closed={closed} toggle={toggle} />
+        <TreeFolder folder={tree} selected={selectedPath} onOpen={(p) => onOpen(p)} toggled={toggled}
+          toggle={toggle} filtering={!!filter} />
         {files.length === 0 && <p className="faint" style={{ padding: 8 }}>No file matches.</p>}
       </nav>
 

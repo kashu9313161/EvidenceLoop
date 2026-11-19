@@ -169,7 +169,10 @@ export interface Report {
       functions: number
       classes: number
       connections: number
+      /** Third-party packages the project's own code imports at runtime. */
       packages: number
+      /** Used only by tests, docs, examples or type hints. */
+      dev_packages: number
       insights: number
       by_severity: Partial<Record<Severity, number>>
     }
@@ -184,6 +187,8 @@ export interface Report {
     skipped_by_reason: { reason: string; files: number }[]
     skipped_files: { path: string; reason: string }[]
     failed_files: { path: string; reason: string }[]
+    /** Text that isn't analysed code (READMEs, docs, config); absent in older reports. */
+    indexed_files?: string[]
     imports: {
       internal_resolved: number
       internal_unresolved: number
@@ -340,7 +345,7 @@ export type AiStatus =
       available: true
       provider: string
       model: string
-      judge: { kind: string; provider: string | null; model: string | null }
+      judge: { kind: 'llm' | 'jev'; provider: string | null; model: string | null; available?: boolean; reason?: string }
     }
 
 export interface SearchResult {
@@ -369,6 +374,9 @@ const q = encodeURIComponent
 export const api = {
   repos: () => request<RepoSummary[]>('/api/repos'),
   report: (snapshot: string) => request<Report>(`/api/report?snapshot=${q(snapshot)}`),
+  /** The report, or the job rebuilding it when it was saved by an older version. */
+  reportOrRebuild: (snapshot: string) =>
+    request<Report | { rebuilding: true; job: Job }>(`/api/report?snapshot=${q(snapshot)}&background=1`),
   file: (snapshot: string, path: string) =>
     request<FileDetail>(`/api/file?snapshot=${q(snapshot)}&path=${q(path)}`),
   search: (snapshot: string, text: string) =>
@@ -401,6 +409,13 @@ export const api = {
   /** A lookup answered from the index as you type (no AI, nothing stored). */
   lookup: (snapshot: string, text: string) =>
     request<AskResult | { kind: 'analytical' }>(`/api/lookup?snapshot=${q(snapshot)}&q=${q(text)}`),
+  /** Delete a repository's analysis from this computer (GitHub is untouched). */
+  removeRepo: (snapshot: string) =>
+    request<{ removed: string }>('/api/repos/remove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshot }),
+    }),
   /** Recent questions and answers for this repository, newest first. */
   asks: (snapshot: string) => request<AskResult[]>(`/api/asks?snapshot=${q(snapshot)}`),
   /** Which models answer and judge. */

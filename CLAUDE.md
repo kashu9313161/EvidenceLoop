@@ -16,8 +16,11 @@ when the prompt changes. The map layout (`web/src/mapLayout.ts`) is shared by th
 
 Ask (`POST /api/ask`, `intelligence/ask.py`): `retrieval/router.py` sends lookups to `retrieval/lookups.py` (symbols,
 calls, imports, graph; no AI) and everything else through `retrieval/evidence.py` (numbered, hashed, redacted items),
-the answering model, then `verification/checks.py` (citation checks, then an `intelligence/evaluators` evaluator;
-`LlmJudgeEvaluator` now, Jev later behind the same protocol). Provider calls go through `intelligence/sendlog.Metered`
+the answering model, then `verification/checks.py` (citation checks, then an `intelligence/evaluators` evaluator:
+`LlmJudgeEvaluator`, or `JevEvaluator` via the official `typesafe-sdk` when `EL_EVALUATOR=jev`; chosen in
+`evaluators/choice.py`; Jev tests mock the SDK with an `httpx2.MockTransport`). Gate A (`evaluation/gate_a/run.py`,
+`metrics.py`) scores evaluators against `candidates.yaml` human labels; the decision lives in `docs/decisions/gate-a.md`,
+and calibrated thresholds go in `Thresholds` defaults. Provider calls go through `intelligence/sendlog.Metered`
 (per-question `Budget`, logged to `provider_sends`); results go to `asks`, `ask_claims`, `ask_claim_evidence`. Tests use
 `FakeProvider` and a fixed evaluator. In the UI, `CommandBox` (top right) calls `/api/search` and `GET /api/lookup`
 (`answer_lookup`: no AI, nothing stored) as you type; `Chat` (bottom right) posts to `/api/ask`, loads history from

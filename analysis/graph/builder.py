@@ -40,6 +40,7 @@ class ExternalUse:
     package: str
     kind: str  # stdlib | external
     files: set[str] = field(default_factory=set)
+    runtime_files: set[str] = field(default_factory=set)  # imported for real, not for type hints
     first_line: dict[str, int] = field(default_factory=dict)
     lines: dict[str, list[int]] = field(default_factory=dict)
 
@@ -124,6 +125,8 @@ def build_graph(
             elif res.kind in ("stdlib", "external") and res.package:
                 use = externals.setdefault(res.package, ExternalUse(res.package, res.kind))
                 use.files.add(importer)
+                if not (row.get("kind") == "type" or line in type_only_lines.get(importer, ())):
+                    use.runtime_files.add(importer)
                 use.first_line.setdefault(importer, line)
                 use.lines.setdefault(importer, []).append(line)
             elif res.kind == "unresolved":

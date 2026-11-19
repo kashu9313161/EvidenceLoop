@@ -35,7 +35,7 @@ function FlowTree({ flow, onSelect }: { flow: Flow; onSelect: (path: string) => 
         <button className="link-btn" onClick={() => onSelect(flow.entry)} title={flow.entry}>
           <strong>{fileName(flow.entry)}</strong>
         </button>
-        <span className="kind">{flow.reason || flow.kind}</span>
+        <span className="kind"><Rich text={flow.reason || flow.kind} /></span>
       </div>
       {shown.length > 0 ? (
         <ul>
@@ -83,14 +83,14 @@ export function Overview({ report, onSelect, onOpenIssue, onTab }: Props) {
     <div className="page">
       <div className="overview-top">
         <div>
-          <h1 className="lede">{summary.headline}</h1>
+          <h1 className="lede"><Rich text={summary.headline} /></h1>
           {summary.readme && (
             <blockquote className="readme-quote">
               {summary.readme}
               <cite>From {summary.readme_path}</cite>
             </blockquote>
           )}
-          <p className="facts">{summary.facts.join(' ')}</p>
+          <p className="facts"><Rich text={summary.facts.join(' ')} /></p>
         </div>
         <MiniMap report={report} onOpen={() => onTab('map')} />
       </div>
@@ -100,7 +100,14 @@ export function Overview({ report, onSelect, onOpenIssue, onTab }: Props) {
         <div className="stat" role="listitem"><b>{totals.source_loc.toLocaleString()}</b><span>lines of source code</span></div>
         <div className="stat" role="listitem"><b>{totals.connections}</b><span>connections between files</span></div>
         <div className="stat" role="listitem"><b>{totals.test_files}</b><span>test files</span></div>
-        <div className="stat" role="listitem"><b>{totals.packages}</b><span>third-party packages</span></div>
+        <div className="stat" role="listitem"
+          title={totals.dev_packages ? `Plus ${plural(totals.dev_packages, 'package')} used only by tests, docs, examples or type hints` : undefined}>
+          <b>{totals.packages}</b>
+          <span>
+            {totals.packages === 1 ? 'runtime dependency' : 'runtime dependencies'}
+            {totals.dev_packages ? `, +${totals.dev_packages} for development` : ''}
+          </span>
+        </div>
         <div className={`stat ${high ? 'alert' : ''}`} role="listitem">
           <b>{totals.insights}</b>
           <span>{high ? `issues, ${high} high severity` : 'issues found'}</span>
@@ -126,7 +133,7 @@ export function Overview({ report, onSelect, onOpenIssue, onTab }: Props) {
                 <div>
                   <h3>{areaLabel(area.name)}</h3>
                   <p>
-                    {area.description.split('Centre of gravity: ')[0]}
+                    <Rich text={area.description.split('Centre of gravity: ')[0]} />
                     Most connected:{' '}
                     <button className="link-btn" onClick={() => onSelect(area.key_file)}>
                       {fileName(area.key_file)}

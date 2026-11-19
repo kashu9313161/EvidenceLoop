@@ -1,9 +1,12 @@
 
+import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-DATA_DIR = PROJECT_ROOT / "data"
+# Where analyses are kept: the database and extracted repositories. EL_DATA_DIR moves it (a
+# bigger disk, or a clean folder to try things out); the default is data/ in the project.
+DATA_DIR = Path(os.environ.get("EL_DATA_DIR", "").strip() or PROJECT_ROOT / "data").expanduser()
 REPOSITORIES_DIR = DATA_DIR / "repositories"
 TEMP_DIR = DATA_DIR / "tmp"
 

@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from analysis.understanding.report import load_report
 from intelligence.budget import Budget, BudgetExceeded
 from intelligence.evaluators import Evaluator, Thresholds
-from intelligence.evaluators.llm_judge import LlmJudgeEvaluator
+from intelligence.evaluators.choice import make_evaluator
 from intelligence.providers import Provider, ProviderError, ai_status
 from intelligence.sendlog import Metered, record_sends
 from retrieval.evidence import EvidenceItem, build_evidence, format_evidence
@@ -180,11 +180,26 @@ def ask(snapshot_id: str, question: str, answer_provider: Provider | None = None
     status, summary, evidence, claims = _analytical(
         snapshot_id, question, report, files, answer_provider, judge_provider, evaluator,
         metered, thresholds)
+    if status == "needs_ai":
+        route = Route("analytical", reason="An open question: it needs AI to answer.")
     result = _result(snapshot_id, question, route, status, summary, claims, evidence,
                      metered.budget.summary(), answer_provider, thresholds)
-    save_ask(result)
+    if status != "needs_ai":  # an unanswered question isn't worth keeping in the history
+        save_ask(result)
     record_sends(snapshot_id, result["id"], metered.sends)
     return result
+
+
+def example_lookups(report: dict) -> tuple[str, str]:
+    """Two lookups that work in this repository: where its most complex important function is,
+    and what calls it."""
+    code = sorted((f for f in report["files"] if not f["is_test"] and f["function_metrics"]),
+                  key=lambda f: -f["importance"])
+    if code:
+        fn = max(code[0]["function_metrics"], key=lambda m: m["complexity"])
+        name = fn["name"].rsplit(".", 1)[-1]
+        return f"where is {name}", f"what calls {name}"
+    return "where is main", "which files use requests"
 
 
 def _analytical(snapshot_id: str, question: str, report: dict, files: SnapshotFiles,
@@ -192,10 +207,13 @@ def _analytical(snapshot_id: str, question: str, report: dict, files: SnapshotFi
                 evaluator: Evaluator | None, metered: Metered,
                 thresholds: Thresholds) -> tuple[str, str, list[EvidenceItem], list[ClaimResult]]:
     if answer_provider is None:
-        reason = ai_status()[1] or "AI isn't available."
+        where, calls = example_lookups(report)
+        reason = ai_status()[1] or "AI isn't set up."
         return ("needs_ai",
-                f"This question needs AI to answer. {reason} Lookups such as "
-                f"\"where is load_data\" or \"what calls main\" work without it.", [], [])
+                f"This question needs AI to answer. {reason} Set the key in the terminal "
+                f"before starting EvidenceLoop (PowerShell: `$env:GEMINI_API_KEY=\"...\"`), "
+                f"then restart it. Lookups such as \"{where}\" or \"{calls}\" work without "
+                f"it.", [], [])
 
     evidence = build_evidence(snapshot_id, question, report, files)
     if not evidence:
@@ -213,8 +231,8 @@ def _analytical(snapshot_id: str, question: str, report: dict, files: SnapshotFi
 
     summary = str(data.get("summary", "")).strip() or "The AI gave no summary."
     package = {e.id: e for e in evidence}
-    if evaluator is None and judge_provider is not None:
-        evaluator = LlmJudgeEvaluator(judge_provider, metered)
+    if evaluator is None:
+        evaluator = make_evaluator(judge_provider, metered)  # EL_EVALUATOR: llm or jev
     results = [verify_claim(c["text"], c["evidence_ids"], package, files, evaluator, thresholds)
                for c in _claims_from(data)]
     return "answered", summary, evidence, results

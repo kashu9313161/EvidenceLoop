@@ -13,6 +13,9 @@ PRICES_PER_MTOK = {
     "gemini-3.5-flash-lite": (0.30, 2.50),
     "gemini-3.6-flash": (0.75, 3.75),
     "gemini-3.8-flash": (0.75, 3.75),
+    # TypeSafe Jev: billed per input token; output tokens are free.
+    "jev-1.13.0": (0.042, 0.0),
+    "jev-1.14.0": (0.042, 0.0),
 }
 DEFAULT_MAX_TOKENS = 60_000
 DEFAULT_MAX_COST = 0.05

@@ -6,12 +6,13 @@ the UI and go through the same citation checks.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
 from retrieval.evidence import EvidenceItem, make_item
 from retrieval.source import SnapshotFiles
-from storage.database import get_connection
+from storage.database import get_connection, like_literal
 
 MAX_HITS = 20
 
@@ -59,11 +60,20 @@ def where(snapshot_id: str, target: str, report: dict, files: SnapshotFiles) -> 
     short = target.rsplit(".", 1)[-1]
     with get_connection() as connection:
         rows = connection.execute(
-            "SELECT relative_path, kind, qualified_name, parent, start_line, end_line FROM symbols "
-            "WHERE snapshot_id = ? AND kind != 'module' AND (name = ? OR qualified_name = ?) "
-            "ORDER BY relative_path, start_line", (snapshot_id, short, target)).fetchall()
+            "SELECT relative_path, kind, qualified_name, parent, start_line, end_line, decorators "
+            "FROM symbols WHERE snapshot_id = ? AND kind != 'module' AND (name = ? OR "
+            "qualified_name = ?) ORDER BY relative_path, start_line",
+            (snapshot_id, short, target)).fetchall()
     rows = [r for r in rows if r["qualified_name"] == target or r["qualified_name"]
             .endswith(target) or "." not in target]
+    # `@overload` stubs are type signatures, not code: leave them out when the real definition
+    # is there, so the hits lead to the implementation.
+    real = {(r["relative_path"], r["qualified_name"]) for r in rows if not _is_overload(r)}
+    stubs = [r for r in rows
+             if _is_overload(r) and (r["relative_path"], r["qualified_name"]) in real]
+    rows = [r for r in rows if r not in stubs]
+    tests = {f["path"] for f in report["files"] if f["is_test"]}
+    rows.sort(key=lambda r: (r["relative_path"] in tests, r["relative_path"], r["start_line"]))
     result = LookupResult("")
     for row in rows[:MAX_HITS]:
         kind = row["kind"]
@@ -77,11 +87,23 @@ def where(snapshot_id: str, target: str, report: dict, files: SnapshotFiles) -> 
         item = make_item(files, f"E{len(result.evidence) + 1}", path, 1, 12, "code", path)
         result.add(item, f"The file {path} matches `{target}`.")
     result.more = max(len(rows) - MAX_HITS, 0)
-    n = len(result.claims)
-    result.summary = (f"`{target}` is defined in {n} place{'s' if n != 1 else ''}." if rows
+    file_hits = len(result.claims) - min(len(rows), MAX_HITS)
+    n = len(rows) + file_hits  # every definition (not only those shown) plus matching files
+    overloads = f" (plus {len(stubs)} type overload{'s' if len(stubs) != 1 else ''})" \
+        if stubs else ""
+    result.summary = (f"`{target}` is defined in {n} place{'s' if n != 1 else ''}{overloads}."
+                      if rows
                       else f"`{target}` matches {n} file{'s' if n != 1 else ''}." if n
                       else f"Nothing named `{target}` was found in this repository.")
     return result
+
+
+def _is_overload(row) -> bool:
+    try:
+        decorators = json.loads(row["decorators"] or "[]")
+    except (TypeError, ValueError):
+        return False
+    return any(str(d).rsplit(".", 1)[-1] == "overload" for d in decorators)
 
 
 def callers(snapshot_id: str, target: str, report: dict, files: SnapshotFiles) -> LookupResult:
@@ -89,8 +111,9 @@ def callers(snapshot_id: str, target: str, report: dict, files: SnapshotFiles) -
     with get_connection() as connection:
         rows = connection.execute(
             "SELECT relative_path, callee, line, enclosing_symbol FROM calls WHERE snapshot_id = ? "
-            "AND (callee = ? OR callee = ? OR callee LIKE ?) ORDER BY relative_path, line",
-            (snapshot_id, target, short, f"%.{short}")).fetchall()
+            "AND (callee = ? OR callee = ? OR callee LIKE ? ESCAPE '\\') "
+            "ORDER BY relative_path, line",
+            (snapshot_id, target, short, f"%.{like_literal(short)}")).fetchall()
     result = LookupResult("")
     for row in rows[:MAX_HITS]:
         where_from = (f"`{row['enclosing_symbol']}`" if row["enclosing_symbol"]
@@ -134,8 +157,8 @@ def users(snapshot_id: str, target: str, report: dict, files: SnapshotFiles) -> 
     with get_connection() as connection:
         rows = connection.execute(
             "SELECT relative_path, module, name, line FROM imports WHERE snapshot_id = ? AND "
-            "(module = ? OR module LIKE ? OR name = ?) ORDER BY relative_path, line",
-            (snapshot_id, target, f"{target}.%", target)).fetchall()
+            "(module = ? OR module LIKE ? ESCAPE '\\' OR name = ?) ORDER BY relative_path, line",
+            (snapshot_id, target, f"{like_literal(target)}.%", target)).fetchall()
     seen: set[str] = set()
     for row in rows:
         if row["relative_path"] in seen or len(result.claims) >= MAX_HITS:

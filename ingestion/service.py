@@ -15,7 +15,7 @@ import time
 import zipfile
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -163,8 +163,10 @@ def github_download(
             if not branch:
                 raise IngestionError("Default branch not found.")
 
+            # The branch name comes from the repository's owner: encode it, so a `#` or `?`
+            # in it can't change which URL is requested.
             commit_response = client.get(
-                f"{GITHUB_API}/repos/{owner}/{name}/commits/{branch}"
+                f"{GITHUB_API}/repos/{owner}/{name}/commits/{quote(str(branch), safe='/')}"
             )
             commit_response.raise_for_status()
             commit_sha = commit_response.json().get("sha")

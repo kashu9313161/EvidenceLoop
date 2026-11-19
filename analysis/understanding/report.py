@@ -57,7 +57,7 @@ def distinct_names(paths: list[str]) -> list[str]:
     return out
 
 
-REPORT_VERSION = "2.3"
+REPORT_VERSION = "2.4"
 CODE_SUFFIXES = {".py": "Python", ".pyi": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
                  ".mjs": "JavaScript", ".cjs": "JavaScript", ".ts": "TypeScript",
                  ".tsx": "TypeScript"}
@@ -73,6 +73,8 @@ CONFIG_NAMES = {"config.py", "settings.py", "conf.py", "constants.py", "configur
 ML_PACKAGES = {"sklearn", "torch", "tensorflow", "keras", "xgboost", "lightgbm", "catboost",
                "transformers", "jax"}
 SNIPPET_LINES = 14
+SNIPPET_CONTEXT = 3  # lines shown either side of a short flagged range
+SNIPPET_CONTEXT_BELOW = 4  # ranges shorter than this get context
 DOCKER_NAMES = {"dockerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yaml"}
 STDLIB_STACK = {"argparse", "sqlite3", "tkinter", "unittest"}
 ENTRY_ROLES = {"entry", "api", "ui", "script"}
@@ -131,11 +133,17 @@ def _snippet(lines: list[str] | None, start: int, end: int, redact: bool = False
         return {"start": start, "lines": []}
     start = max(1, start)
     end = min(len(lines), max(start, end))
-    stop = min(end, start + SNIPPET_LINES - 1)
-    chunk = lines[start - 1 : stop]
+    if end - start < SNIPPET_CONTEXT_BELOW:
+        # A short range (a handler, an import) means little alone: show the lines around it.
+        first = max(1, start - SNIPPET_CONTEXT)
+        stop = min(len(lines), end + SNIPPET_CONTEXT)
+    else:
+        first = start
+        stop = min(end, start + SNIPPET_LINES - 1)
+    chunk = lines[first - 1 : stop]
     if redact:
         chunk = [insight_rules.redact_line(line) for line in chunk]
-    return {"start": start, "lines": chunk, "truncated": stop < end}
+    return {"start": first, "lines": chunk, "truncated": stop < end}
 
 
 # --------------------------------------------------------------------------- roles
@@ -392,8 +400,8 @@ def _measure(b: _Build) -> None:
         if language == "Python" and text is not None and row["status"] == "analyzed":
             try:
                 quality = analyze_python(text, lines)
-            except (SyntaxError, ValueError, RecursionError):
-                quality = None
+            except (SyntaxError, ValueError, RecursionError, MemoryError):
+                quality = None  # a crafted file can't stop the whole analysis
         b.files[path] = {
             "path": path, "language": language, "status": row["status"],
             "failure": row["skip_reason"] if row["status"] == "failed" else None,
@@ -691,6 +699,9 @@ def _coverage(b: _Build) -> dict:
                           for f in b.all_files if f["status"] == "skipped"],
         "failed_files": [{"path": f["relative_path"], "reason": f["skip_reason"]}
                          for f in b.all_files if f["status"] == "failed"],
+        # Text that isn't analysed code (READMEs, docs, config): browsable and searchable.
+        "indexed_files": sorted(f["relative_path"] for f in b.all_files
+                                if f["status"] == "indexed"),
         "imports": {
             "internal_resolved": resolved,
             "internal_unresolved": unresolved,
@@ -783,8 +794,13 @@ def _facts(b: _Build, top: list[str]) -> list[str]:
         reached = len(b.tested & set(testable))
         direct = len(set(b.tests_of) & set(testable))
         via = f" ({direct} directly, the rest through the package)" if reached > direct else ""
-        facts.append(f"{plural(len(test_files), 'test file')} reach "
-                     f"{reached} of {len(testable)} modules{via}.")
+        tests = plural(len(test_files), "test file")
+        if testable:
+            facts.append(f"{tests} reach{'es' if len(test_files) == 1 else ''} "
+                         f"{reached} of {plural(len(testable), 'module')}{via}.")
+        else:
+            facts.append(f"There {'is' if len(test_files) == 1 else 'are'} {tests}, but no "
+                         "module with functions or classes for them to test.")
     else:
         facts.append("There are no automated tests.")
     severities = Counter(i["severity"] for i in b.insights)
@@ -810,7 +826,7 @@ def _summary(b: _Build, externals: list[dict]) -> dict:
             "path": path, "role": info["role"], "fan_in": fan_in(b.graph, path),
             "impact": reach,
             "why": f"{info['role_reason']}; {plural(reach, 'file')} "
-                   "depend on it directly or indirectly",
+                   f"depend{'s' if reach == 1 else ''} on it directly or indirectly",
         })
     qualities = [i["quality"] for i in b.files.values() if i.get("quality")]
     return {
@@ -831,7 +847,10 @@ def _summary(b: _Build, externals: list[dict]) -> dict:
             "functions": sum(len(q.functions) for q in qualities),
             "classes": sum(len(q.classes) for q in qualities),
             "connections": len(b.graph_result.edges),
-            "packages": sum(1 for e in externals if e["kind"] == "external"),
+            "packages": sum(1 for e in externals
+                            if e["kind"] == "external" and e["scope"] == "runtime"),
+            "dev_packages": sum(1 for e in externals
+                                if e["kind"] == "external" and e["scope"] == "development"),
             "insights": len(b.insights),
             "by_severity": dict(Counter(i["severity"] for i in b.insights)),
         },
@@ -915,11 +934,18 @@ def build_report(snapshot_id: str, progress: Progress | None = None) -> dict:
                   _flows):
         stage(b)
 
+    # A package is a runtime dependency only if production code imports it for real; one used
+    # only by tests, docs or examples, or only for type hints, is for development.
+    # The project's own code that runs when it's used: no tests, examples, docs, or build
+    # scripts like setup.py (which import setuptools but aren't part of the package at runtime).
+    production = {p for p in b.core if b.files[p]["role"] not in {"build", "config", "docs"}}
     externals = sorted(
         ({"package": u.package, "kind": u.kind, "files": len(u.files),
+          "scope": "runtime" if u.runtime_files & production else "development",
           "display": STACK_CATALOG.get(u.package, (u.package, ""))[0]}
          for u in b.graph_result.externals.values()),
-        key=lambda e: (e["kind"] != "external", -e["files"], e["package"]),
+        key=lambda e: (e["kind"] != "external", e["scope"] != "runtime", -e["files"],
+                       e["package"]),
     )
     files_json = _files_json(b)
     return {
