@@ -44,6 +44,7 @@ from analysis.understanding.profile import (
     short_name,
 )
 from core.textio import decode_text, detect_encoding
+from ingestion.rules import LEFT_OUT_REASONS
 from storage.database import get_connection, get_snapshot, initialize_database, snapshot_root
 
 
@@ -58,7 +59,7 @@ def distinct_names(paths: list[str]) -> list[str]:
     return out
 
 
-REPORT_VERSION = "2.5"
+REPORT_VERSION = "2.6"
 CODE_SUFFIXES = {".py": "Python", ".pyi": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
                  ".mjs": "JavaScript", ".cjs": "JavaScript", ".ts": "TypeScript",
                  ".tsx": "TypeScript"}
@@ -699,6 +700,38 @@ def _flows(b: _Build) -> None:
     b.routes.sort(key=lambda r: r["supporting"])  # the project's own routes before tutorials'
 
 
+MAX_LISTED_SKIPS = 500
+
+
+def _scope(b: _Build) -> dict:
+    """How much of the source was analysed: all of it, one folder, or the most important files
+    of a repository over the limits, with the folders left out."""
+    keys = b.snapshot.keys() if hasattr(b.snapshot, "keys") else []
+    scope = b.snapshot["scope"] if "scope" in keys else None
+    left_out = [f["relative_path"] for f in b.all_files if f["skip_reason"] in LEFT_OUT_REASONS]
+    analysed = sum(1 for f in b.all_files if f["status"] != "skipped")
+    folders = Counter(p.split("/")[0] if "/" in p else "(top level)" for p in left_out)
+    total = analysed + len(left_out)
+    if not left_out:
+        sentence = f"All {total:,} source files were analysed."
+    else:
+        names = ", ".join(f"{name}/" if name != "(top level)" else name
+                          for name, _ in folders.most_common(6))
+        more = len(folders) - 6
+        sentence = (f"Analysed {analysed:,} of {total:,} source files"
+                    + (f" (the folder {scope}/)" if scope not in (None, "*") else "")
+                    + f". Left out: {names}" + (f" and {more} more folders" if more > 0 else "")
+                    + ".")
+    return {
+        "kind": None if scope is None else ("priority" if scope == "*" else "folder"),
+        "folder": scope if scope not in (None, "*") else None,
+        "source_files": total,
+        "analysed_source_files": analysed,
+        "left_out_folders": [{"folder": n, "files": c} for n, c in folders.most_common()],
+        "sentence": sentence,
+    }
+
+
 def _coverage(b: _Build) -> dict:
     statuses = Counter(f["status"] for f in b.all_files)
     skip_reasons = Counter(f["skip_reason"] or "Not analyzed"
@@ -713,8 +746,10 @@ def _coverage(b: _Build) -> dict:
         "skipped": statuses.get("skipped", 0),
         "failed": statuses.get("failed", 0),
         "skipped_by_reason": [{"reason": r, "files": n} for r, n in skip_reasons.most_common()],
+        # A huge repository skips tens of thousands of files: list the first few hundred.
         "skipped_files": [{"path": f["relative_path"], "reason": f["skip_reason"]}
-                          for f in b.all_files if f["status"] == "skipped"],
+                          for f in b.all_files if f["status"] == "skipped"][:MAX_LISTED_SKIPS],
+        "scope": _scope(b),
         "failed_files": [{"path": f["relative_path"], "reason": f["skip_reason"]}
                          for f in b.all_files if f["status"] == "failed"],
         # Text that isn't analysed code (READMEs, docs, config): browsable and searchable.

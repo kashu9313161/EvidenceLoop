@@ -336,3 +336,23 @@ def test_a_folder_upload_rejects_case_clashes_and_needs_source(isolated_storage)
         service.ingest_folder(folder({"p/App.py": b"1", "p/app.py": b"2"}))
     with pytest.raises(IngestionError, match="no source code"):
         service.ingest_folder(folder({"p/a.csv": b"1"}))
+
+
+# --------------------------------------------------------------------------- coverage
+
+
+def test_the_report_says_how_much_of_the_source_was_analysed(isolated_storage, monkeypatch):
+    from analysis.understanding.report import run_full_analysis
+
+    monkeypatch.setattr(config, "MAX_SOURCE_FILES", 2)
+    files = {"proj/main.py": b"print(1)\n", "proj/README.md": b"# p\n",
+             **{f"proj/lib/m{i}.py": b"x = 1\n" for i in range(3)},
+             "proj/tools/t.py": b"y = 2\n"}
+    snapshot = service.ingest_folder(folder(files))["snapshot_id"]
+    scope = run_full_analysis(snapshot)["coverage"]["scope"]
+
+    assert scope["kind"] == "priority"
+    assert scope["analysed_source_files"] == 2 and scope["source_files"] == 6
+    assert scope["left_out_folders"] == [{"folder": "lib", "files": 3},
+                                         {"folder": "tools", "files": 1}]
+    assert scope["sentence"] == "Analysed 2 of 6 source files. Left out: lib/, tools/."
