@@ -38,7 +38,7 @@ export function Inspector({ report, file, onSelect, onOpenCode, onOpenIssue, onC
   impactOn, onToggleImpact }: Props) {
   const issues = report.insights.filter((issue) => file.insights.includes(issue.id))
   const hot = [...file.function_metrics]
-    .sort((a, b) => b.complexity - a.complexity || b.lines - a.lines)
+    .sort((a, b) => b.complexity - a.complexity || b.callers - a.callers || b.lines - a.lines)
     .slice(0, 5)
   const libraries = report.dependencies.external
     .filter((dep) => dep.kind === 'external' && file.packages.includes(dep.package))
@@ -127,7 +127,15 @@ export function Inspector({ report, file, onSelect, onOpenCode, onOpenIssue, onC
                   </button>{' '}
                   <span className="faint" style={{ fontSize: 13 }}>
                     complexity {fn.complexity}, {plural(fn.lines, 'line')}
+                    {fn.callers > 0 ? `, ${plural(fn.callers, 'caller')}` : ''}
                   </span>
+                  {fn.id && file.language === 'Python' && (
+                    <>
+                      {' '}
+                      <button className="link-btn explain-link" onClick={() => onOpenCode(file.path, fn.start)}
+                        title="Open this function with a card explaining what it does">Explain</button>
+                    </>
+                  )}
                 </li>
               ))}
             </ul>

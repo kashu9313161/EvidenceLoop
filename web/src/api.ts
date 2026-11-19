@@ -38,6 +38,12 @@ export interface FunctionMetric {
   complexity: number
   lines: number
   nesting: number
+  /** Symbol id (`path::qualified_name`), for its explanation card. */
+  id: string | null
+  public: boolean
+  /** Distinct functions (or module top levels) that call it / that it calls. */
+  callers: number
+  callees: number
 }
 
 export interface FileInfo {
@@ -207,6 +213,8 @@ export interface Report {
     area_edges: { source: string; target: string; edges: number }[]
   }
   insights: Issue[]
+  /** Function-level calls (Python): resolved through imports, or guessed from a unique name. */
+  calls: { resolved: number; confirmed: number; inferred: number; unresolved: number; dynamic: number }
   dependencies: {
     external: { package: string; kind: string; files: number; display: string }[]
     manifests: {
@@ -256,21 +264,46 @@ export interface FileDetail {
   symbols: { kind: string; name: string; start: number; end: number }[]
 }
 
+/** Where an answer came from: worked out from the code, the code's docstring, written by AI,
+ * or written by AI and checked against the code. */
+export type RowSource = 'code' | 'docstring' | 'ai' | 'ai-checked'
+
+export interface Row {
+  text: string
+  source: RowSource
+}
+
 export interface KeyPart {
   symbol: string
   kind: string
   start: number
   end: number
   does: string
+  source: RowSource
 }
 
+/** An AI explanation of a file: the five questions. */
 export interface Explanation {
+  /** Same as purpose (kept for one-line glances). */
   summary: string
-  key_parts: KeyPart[]
+  purpose: string
+  inputs: string
+  steps: KeyPart[]
+  outputs: string
+  why: string
   dropped: number
   model: string
   sent: string
   created_at: string
+}
+
+/** The five questions about a file answered from the code alone. */
+export interface FileFacts {
+  purpose: Row | null
+  inputs: Row
+  steps: KeyPart[]
+  outputs: Row & { names: { name: string; by: string[] }[] }
+  why: Row
 }
 
 export interface ExplainResponse {
@@ -278,6 +311,78 @@ export interface ExplainResponse {
   reason?: string
   status?: 'ready' | 'missing' | 'unavailable'
   explanation?: Explanation | null
+  facts?: FileFacts | null
+}
+
+export interface CardInput {
+  name: string
+  kind: 'positional_only' | 'positional' | 'keyword_only' | 'var_positional' | 'var_keyword'
+  type: string | null
+  default: string | null
+  meaning: string | null
+  source: RowSource
+}
+
+export interface CardStep {
+  text: string
+  start: number
+  end: number
+  source: RowSource
+}
+
+export interface CardCall {
+  id: string
+  name: string
+  path?: string
+  line: number
+  tier: 'confirmed' | 'inferred'
+}
+
+export type SideEffectKind = 'file' | 'network' | 'database' | 'env' | 'subprocess' | 'log'
+
+/** A function's card: the five questions plus side effects and an example. */
+export interface FunctionCard {
+  symbol: string
+  name: string
+  kind: 'function' | 'method'
+  path: string
+  start: number
+  end: number
+  complexity: number
+  trivial: boolean
+  purpose: Row | null
+  inputs: CardInput[]
+  steps: CardStep[]
+  output: { type: string | null; lines: number[]; text: string; meaning: string | null; source: RowSource }
+  why: Row & { callers: (CardCall & { path: string })[] }
+  callees: CardCall[]
+  raises: { name: string; line: number }[]
+  side_effects: { kind: SideEffectKind; call: string; line: number }[]
+  example: {
+    path: string
+    start: number
+    end: number
+    code: string
+    from_test: boolean
+    caller: string
+    source: RowSource
+  } | null
+  ai: {
+    /** off: no API key; trivial: short enough to read; missing: not written yet. */
+    status: 'off' | 'trivial' | 'ready' | 'missing'
+    reason: string | null
+    model?: string
+    sent?: string
+    dropped?: number
+    created_at?: string
+  }
+}
+
+export interface FunctionCardResponse {
+  available: boolean
+  status: 'off' | 'trivial' | 'ready' | 'missing' | 'unavailable'
+  reason?: string
+  card?: FunctionCard
 }
 
 export type ClaimStatus = 'verified' | 'insufficient' | 'rejected'
@@ -429,6 +534,16 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ snapshot, path, refresh }),
+    }),
+  /** A function's card from the code, plus any cached AI answer; never calls the model. */
+  functionCard: (snapshot: string, symbol: string) =>
+    request<FunctionCardResponse>(`/api/explain/function?snapshot=${q(snapshot)}&symbol=${q(symbol)}`),
+  /** Write the function's AI answer now (or rewrite it with refresh). */
+  explainFunction: (snapshot: string, symbol: string, refresh = false) =>
+    request<FunctionCardResponse>('/api/explain/function', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshot, symbol, refresh }),
     }),
 }
 

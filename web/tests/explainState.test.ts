@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { explainStep, firstSentence } from '../src/explainState.ts'
 
-const explanation = { summary: 'Loads data.', key_parts: [], dropped: 0, model: 'm', sent: 'Sent: code.', created_at: 'now' }
+const explanation = {
+  summary: 'Loads data.', purpose: 'Loads data.', inputs: '', steps: [], outputs: '', why: '',
+  dropped: 0, model: 'm', sent: 'Sent: code.', created_at: 'now',
+}
 
 test('without an API key the facts stand alone', () => {
   assert.equal(explainStep({ available: false, reason: 'Set ANTHROPIC_API_KEY' }, true), 'facts')

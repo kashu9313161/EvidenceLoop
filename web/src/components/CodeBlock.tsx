@@ -1,5 +1,6 @@
 import { Highlight, type PrismTheme } from 'prism-react-renderer'
 import { useEffect, useRef } from 'react'
+import { scrollToLine } from '../scrollToLine'
 import { languageOf, useTheme } from '../util'
 
 const blueprint: PrismTheme = {
@@ -44,10 +45,7 @@ export function CodeBlock({ code, path, startLine = 1, highlight, focus }: Props
     // Scroll only the code's own scroller, never the page around it.
     const line = focusRef.current
     const scroller = line?.closest<HTMLElement>('[data-scroller]')
-    if (line && scroller) {
-      // the scroller is position: relative, so offsetTop is measured from its top
-      scroller.scrollTop = Math.max(0, line.offsetTop - scroller.clientHeight / 3)
-    }
+    if (line && scroller) return scrollToLine(line, scroller)
   }, [focus, code])
 
   return (

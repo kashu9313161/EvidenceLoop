@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, type Explanation, type FileInfo } from '../api'
+import { api, type Explanation, type FileFacts, type FileInfo } from '../api'
+import { fileRows } from '../cardRows'
 import { explainStep, firstSentence } from '../explainState'
 import { Rich } from './bits'
+import { SourceTag } from './FunctionCard'
 
-/** Explanations already fetched this visit, so moving between views doesn't ask again. */
+/** Explanations and code facts already fetched this visit, so moving between views doesn't
+ * ask again. */
 const known = new Map<string, Explanation>()
+const knownFacts = new Map<string, FileFacts | null>()
 
 type View =
   | { key: string; phase: 'facts'; aiOff?: boolean }
@@ -15,6 +19,8 @@ interface Props {
   snapshotId: string
   file: FileInfo
   onOpenLine: (line: number) => void
+  /** Light up a step's lines in the code while the pointer is on it (null to clear). */
+  onHighlight?: (range: [number, number] | null) => void
   /** Above the code, where space matters: the reader can fold it away (remembered). */
   collapsible?: boolean
 }
@@ -43,10 +49,9 @@ function useExplanation(snapshotId: string, path: string, mayWrite: boolean) {
     setView({ key: asked, phase: 'writing' })
     api.explain(snapshotId, path, refresh)
       .then((res) => {
-        if (res.status === 'ready' && res.explanation) {
-          known.set(asked, res.explanation)
-          setVersion((v) => v + 1)
-        }
+        if (res.facts !== undefined) knownFacts.set(asked, res.facts)
+        if (res.status === 'ready' && res.explanation) known.set(asked, res.explanation)
+        setVersion((v) => v + 1)
         if (shown.current === asked) setView({ key: asked, phase: 'facts' })
       })
       .catch((e: Error) => {
@@ -60,10 +65,11 @@ function useExplanation(snapshotId: string, path: string, mayWrite: boolean) {
     api.explanation(snapshotId, path)
       .then((res) => {
         if (cancelled) return
+        knownFacts.set(key, res.facts ?? null)
+        setVersion((v) => v + 1)
         const step = explainStep(res, mayWrite)
         if (step === 'show') {
           known.set(key, res.explanation!)
-          setVersion((v) => v + 1)
         } else if (step === 'write') {
           write(false)
         } else {
@@ -78,6 +84,7 @@ function useExplanation(snapshotId: string, path: string, mayWrite: boolean) {
   const writing = current?.phase === 'writing'
   return {
     explanation: writing ? undefined : known.get(key),
+    facts: knownFacts.get(key),
     writing,
     error: current?.phase === 'error' ? current.error : null,
     aiOff: current?.phase === 'facts' && !!current.aiOff,
@@ -86,10 +93,11 @@ function useExplanation(snapshotId: string, path: string, mayWrite: boolean) {
   }
 }
 
-/** "What is this file?": an AI-written paragraph and where to start reading, over the
- * deterministic description. Without an API key only the description shows. */
-export function FileExplanation({ snapshotId, file, onOpenLine, collapsible = false }: Props) {
-  const { explanation, writing, error, aiOff, regenerate, retry } = useExplanation(snapshotId, file.path, true)
+/** "What is this file?": five questions (what it is for, what goes in, what happens, what
+ * comes out, why it is needed). The code answers each one; with an API key the AI's checked
+ * answers replace them. Each row says where it came from. */
+export function FileExplanation({ snapshotId, file, onOpenLine, onHighlight, collapsible = false }: Props) {
+  const { explanation, facts, writing, error, aiOff, regenerate, retry } = useExplanation(snapshotId, file.path, true)
   const [folded, setFolded] = useState(() => collapsible && readFolded())
   const fold = (next: boolean) => {
     setFolded(next)
@@ -99,21 +107,23 @@ export function FileExplanation({ snapshotId, file, onOpenLine, collapsible = fa
       /* private mode: the choice lasts for this visit */
     }
   }
+  const rows = fileRows(explanation, facts)
+  const purpose = rows.find((r) => r.key === 'purpose')
 
-  if (explanation && folded) {
+  if (collapsible && folded) {
     return (
       <div className="explain">
         <button className="link-btn explain-unfold" onClick={() => fold(false)} aria-expanded="false">
           ▸ What this file does
         </button>
-        <p className="explain-facts"><Rich text={file.description} /></p>
+        <p className="explain-facts">{purpose ? purpose.text : <Rich text={file.description} />}</p>
       </div>
     )
   }
 
   return (
     <div className="explain">
-      {explanation && (
+      {rows.length > 0 ? (
         <section className="explain-ai" aria-label="What this file does">
           <h3>
             {collapsible ? (
@@ -121,33 +131,47 @@ export function FileExplanation({ snapshotId, file, onOpenLine, collapsible = fa
                 title="Fold this away to give the code more room">▾ What this file does</button>
             ) : 'What this file does'}
           </h3>
-          <p>{explanation.summary}</p>
-          {explanation.key_parts.length > 0 && (
-            <>
-              <h4>Start reading here</h4>
-              <ul className="key-parts">
-                {explanation.key_parts.map((part) => (
-                  <li key={`${part.symbol}-${part.start}`}>
-                    <button className="link-btn" onClick={() => onOpenLine(part.start)}
-                      title={`Open ${part.symbol} at line ${part.start}`}>
-                      <code>{part.symbol.split('.').pop()}{part.kind === 'class' ? '' : '()'}</code>
-                    </button>
-                    <span className="lines">lines {part.start}–{part.end}</span>
-                    <span className="does">{part.does}</span>
-                  </li>
-                ))}
-              </ul>
-            </>
+          <dl className="card-rows">
+            {rows.map((row) => (
+              <div className="card-row" key={row.key}>
+                <dt>{row.label} <SourceTag source={row.source} /></dt>
+                <dd>
+                  {row.steps ? (
+                    <ul className="key-parts">
+                      {row.steps.map((part) => (
+                        <li key={`${part.symbol}-${part.start}`}
+                          onMouseEnter={() => onHighlight?.([part.start, part.end])}
+                          onMouseLeave={() => onHighlight?.(null)}>
+                          <button className="link-btn"
+                            onClick={() => { onHighlight?.([part.start, part.end]); onOpenLine(part.start) }}
+                            onFocus={() => onHighlight?.([part.start, part.end])}
+                            onBlur={() => onHighlight?.(null)}
+                            title={`Open ${part.symbol} at line ${part.start}`}>
+                            <code>{part.symbol.split('.').pop()}{part.kind === 'class' ? '' : '()'}</code>
+                          </button>
+                          <span className="lines">lines {part.start}–{part.end}</span>
+                          <span className="does">{part.does}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : row.text}
+                </dd>
+              </div>
+            ))}
+          </dl>
+          {explanation && (
+            <div className="explain-note">
+              <span>AI rows were written from the code and the facts.</span>
+              <button className="link-btn" onClick={regenerate}>Regenerate</button>
+              <details>
+                <summary>What was sent</summary>
+                <p>{explanation.sent} Model: {explanation.model}.</p>
+              </details>
+            </div>
           )}
-          <div className="explain-note">
-            <span>Written by AI from the code and the facts below.</span>
-            <button className="link-btn" onClick={regenerate}>Regenerate</button>
-            <details>
-              <summary>What was sent</summary>
-              <p>{explanation.sent} Model: {explanation.model}.</p>
-            </details>
-          </div>
         </section>
+      ) : (
+        <p><Rich text={file.description} /></p>
       )}
       {writing && <p className="explain-wait" role="status">Writing a plain-English explanation of this file…</p>}
       {error && (
@@ -156,11 +180,10 @@ export function FileExplanation({ snapshotId, file, onOpenLine, collapsible = fa
           <button className="link-btn" onClick={retry}>Try again</button>
         </p>
       )}
-      <p className={explanation ? 'explain-facts' : undefined}><Rich text={file.description} /></p>
       {aiOff && collapsible && (
         <p className="explain-hint">
-          Want a plain-English summary of each file? Set <code>GEMINI_API_KEY</code> in the terminal,
-          then restart EvidenceLoop.
+          These answers come from the code. Want them in plain English? Set <code>GEMINI_API_KEY</code> in
+          the terminal, then restart EvidenceLoop.
         </p>
       )}
     </div>

@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, type FileDetail, type FileInfo, type Report } from '../api'
+import { cardFor } from '../cardRows'
 import { plainFileNote } from '../fileNote'
 import { fileName, plural } from '../util'
 import { Rich, Sev } from './bits'
 import { CodeBlock } from './CodeBlock'
 import { FileExplanation } from './FileExplanation'
+import { FunctionCard } from './FunctionCard'
 
 interface Props {
   report: Report
@@ -115,6 +117,9 @@ export function Files({ report, path, line, onOpen, onOpenIssue }: Props) {
   const [detail, setDetail] = useState<FileDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [range, setRange] = useState<[number, number] | null>(null)
+  // The function whose card is open, and the lines a hovered step lights up.
+  const [card, setCard] = useState<string | null>(null)
+  const [hover, setHover] = useState<[number, number] | null>(null)
 
   const files = useMemo(() => {
     const all: TreeFile[] = [...report.files, ...(report.coverage.indexed_files ?? []).map(textFile)]
@@ -130,6 +135,7 @@ export function Files({ report, path, line, onOpen, onOpenIssue }: Props) {
     setDetail(null)
     setError(null)
     setRange(null)
+    setHover(null)
     api.file(report.snapshot.id, selectedPath)
       .then((d) => { if (!cancelled) setDetail(d) })
       .catch((e: Error) => { if (!cancelled) setError(e.message) })
@@ -139,8 +145,12 @@ export function Files({ report, path, line, onOpen, onOpenIssue }: Props) {
   useEffect(() => {
     if (line && info) {
       const fn = info.function_metrics.find((f) => f.start === line)
-      setRange(fn ? [fn.start, fn.end] : null)
+      if (fn) setRange([fn.start, fn.end])
+      else if (!range || line < range[0] || line > range[1]) setRange(null)
     }
+    // Python functions get a card: opened at their first line, kept while a line inside is shown.
+    setCard((current) => (info?.language === 'Python' ? cardFor(info.function_metrics, line, current) : null))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [line, info])
 
   const toggle = (p: string) => setToggled((prev) => {
@@ -173,21 +183,31 @@ export function Files({ report, path, line, onOpen, onOpenIssue }: Props) {
               <span className="faint" style={{ fontSize: 13.5, marginLeft: 6 }}>
                 {plural(info.loc, 'line')} of code, used by {plural(info.fan_in, 'file')}, uses {plural(info.fan_out, 'file')}
               </span>
-              <FileExplanation snapshotId={report.snapshot.id} file={info} collapsible
-                onOpenLine={(at) => onOpen(info.path, at)} />
             </header>
             <div className="file-panels">
-              <div className="file-code" data-scroller>
-                {error && <p className="muted" style={{ padding: 24 }}>{error}</p>}
-                {detail && detail.content == null && (
-                  <p className="muted" style={{ padding: 24 }}>This file can't be shown (binary or too large).</p>
+              <div className="file-main">
+                {card && (
+                  <FunctionCard key={card} snapshotId={report.snapshot.id} symbolId={card}
+                    onOpen={(p, at) => onOpen(p, at)} onHighlight={setHover}
+                    onClose={() => { setCard(null); setHover(null) }} />
                 )}
-                {detail?.content != null && (
-                  <CodeBlock code={detail.content.replace(/\n$/, '')} path={info.path}
-                    highlight={range} focus={line ?? range?.[0] ?? null} />
-                )}
-                {!detail && !error && <p className="faint" style={{ padding: 24 }}>Loading code…</p>}
+                <div className="file-code" data-scroller>
+                  {error && <p className="muted" style={{ padding: 24 }}>{error}</p>}
+                  {detail && detail.content == null && (
+                    <p className="muted" style={{ padding: 24 }}>This file can't be shown (binary or too large).</p>
+                  )}
+                  {detail?.content != null && (
+                    <CodeBlock code={detail.content.replace(/\n$/, '')} path={info.path}
+                      highlight={hover ?? range} focus={hover?.[0] ?? line ?? range?.[0] ?? null} />
+                  )}
+                  {!detail && !error && <p className="faint" style={{ padding: 24 }}>Loading code…</p>}
+                </div>
               </div>
+              {/* Its own column between the code and the rail; scrolls on its own, folds to its heading. */}
+              <aside className="file-explain-col" aria-label="What this file does">
+                <FileExplanation snapshotId={report.snapshot.id} file={info} collapsible
+                  onOpenLine={(at) => onOpen(info.path, at)} onHighlight={setHover} />
+              </aside>
               <aside className="file-side">
                 {issues.length > 0 && (
                   <div className="rel">
@@ -212,7 +232,12 @@ export function Files({ report, path, line, onOpen, onOpenIssue }: Props) {
                       const cx = complexity.get(`${symbol.name}@${symbol.start}`)
                       return (
                         <li key={`${symbol.name}-${symbol.start}`}>
-                          <button onClick={() => { setRange([symbol.start, symbol.end]); onOpen(info.path, symbol.start) }}
+                          <button onClick={() => {
+                            setRange([symbol.start, symbol.end])
+                            const fn = info.function_metrics.find((f) => f.start === symbol.start && f.name === symbol.name)
+                            if (fn?.id && info.language === 'Python') setCard(fn.id)
+                            onOpen(info.path, symbol.start)
+                          }}
                             title={`${symbol.kind}, lines ${symbol.start}–${symbol.end}`}
                             style={{ paddingLeft: 6 + (symbol.name.split('.').length - 1) * 12 }}>
                             <span className="nm">{symbol.name.split('.').pop()}{symbol.kind !== 'class' ? '()' : ''}</span>
