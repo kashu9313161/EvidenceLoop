@@ -260,7 +260,7 @@ def _pregenerate_explanations(snapshot_id: str) -> None:
     clicks are instant. Without one, do nothing."""
     provider = explain.current_provider()
     if provider is not None:
-        threading.Thread(target=explain.pregenerate, args=(snapshot_id, provider),
+        threading.Thread(target=explain.pregenerate_all, args=(snapshot_id, provider),
                          daemon=True).start()
 
 
@@ -547,19 +547,29 @@ def _no_ai() -> dict:
     return {"available": False, "reason": ai_status()[1]}
 
 
+def _file_facts(snapshot: str, path: str) -> dict | None:
+    try:
+        return explain.file_facts_for(snapshot, path)
+    except ExplainError:
+        return None
+
+
 @app.get("/api/explain")
 def explanation(snapshot: str = Query(...), path: str = Query(...)) -> dict:
-    """The cached AI explanation of a file, if there is one. Never calls the model: writing
-    one costs money, so it takes a POST, which other sites can't send."""
+    """The five questions about a file answered from the code (`facts`), plus the cached AI
+    explanation if there is one. Never calls the model: writing one costs money, so it takes a
+    POST, which other sites can't send."""
     _require_snapshot(snapshot)
+    facts = _file_facts(snapshot, path)
     provider = explain.current_provider()
     if provider is None:
-        return _no_ai()
+        return {**_no_ai(), "facts": facts}
     try:
         found = explain.cached_explanation(snapshot, path, provider.model)
     except ExplainError as exc:
-        return {"available": True, "status": "unavailable", "reason": str(exc)}
-    return {"available": True, "status": "ready" if found else "missing", "explanation": found}
+        return {"available": True, "status": "unavailable", "reason": str(exc), "facts": facts}
+    return {"available": True, "status": "ready" if found else "missing", "explanation": found,
+            "facts": facts}
 
 
 class ExplainRequest(BaseModel):
@@ -582,7 +592,45 @@ def write_explanation(request: ExplainRequest) -> dict:
         return {"available": True, "status": "unavailable", "reason": str(exc)}
     except ProviderError as exc:
         raise HTTPException(502, str(exc)) from exc
-    return {"available": True, "status": "ready", "explanation": found}
+    return {"available": True, "status": "ready", "explanation": found,
+            "facts": _file_facts(request.snapshot, request.path)}
+
+
+@app.get("/api/explain/function")
+def function_explanation(snapshot: str = Query(...), symbol: str = Query(...)) -> dict:
+    """A function's card: the code facts, plus the cached AI answer if there is one. Never
+    calls the model (writing takes a POST). Without a key the card has the code rows only."""
+    _require_snapshot(snapshot)
+    provider = explain.current_provider()
+    try:
+        card = explain.function_card(snapshot, symbol, provider,
+                                     reason=ai_status()[1] if provider is None else "")
+    except ExplainError as exc:
+        return {"available": provider is not None, "status": "unavailable", "reason": str(exc)}
+    return {"available": provider is not None, "status": card["ai"]["status"], "card": card}
+
+
+class FunctionExplainRequest(BaseModel):
+    snapshot: str
+    symbol: str
+    refresh: bool = False
+
+
+@app.post("/api/explain/function")
+def write_function_explanation(request: FunctionExplainRequest) -> dict:
+    """Write a function's AI answer now (or return the cached one), or rewrite it."""
+    _require_snapshot(request.snapshot)
+    provider = explain.current_provider()
+    if provider is None:
+        return function_explanation(request.snapshot, request.symbol)
+    try:
+        card = explain.explain_function(request.snapshot, request.symbol, provider,
+                                        refresh=request.refresh)
+    except ExplainError as exc:
+        return {"available": True, "status": "unavailable", "reason": str(exc)}
+    except ProviderError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return {"available": True, "status": card["ai"]["status"], "card": card}
 
 
 # --------------------------------------------------------------------------- web app

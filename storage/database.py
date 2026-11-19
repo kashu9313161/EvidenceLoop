@@ -197,6 +197,19 @@ CREATE TABLE IF NOT EXISTS file_explanations (
     PRIMARY KEY (snapshot_id, path, content_sha256, prompt_version, model)
 );
 
+-- AI-written function cards, cached until the function's text, its callers, the prompt or the
+-- model changes (input_sha256 covers the function and its call sites).
+CREATE TABLE IF NOT EXISTS function_explanations (
+    snapshot_id TEXT NOT NULL,
+    symbol_id TEXT NOT NULL,
+    input_sha256 TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    model TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    explanation TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, symbol_id, input_sha256, prompt_version, model)
+);
+
 -- M3: Ask. One row per question; its claims; the evidence each claim cites.
 CREATE TABLE IF NOT EXISTS asks (
     ask_id TEXT PRIMARY KEY,
@@ -324,7 +337,8 @@ def snapshot_root(snapshot) -> Path | None:
 
 SNAPSHOT_TABLES = ("files", "files_fts", "file_stages", "symbols", "symbols_fts", "imports",
                    "calls", "graph_nodes", "graph_edges", "analysis_runs", "analysis_reports",
-                   "file_explanations", "asks", "ask_claims", "ask_claim_evidence",
+                   "file_explanations", "function_explanations", "asks", "ask_claims",
+                   "ask_claim_evidence",
                    "provider_sends")
 
 

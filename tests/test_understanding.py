@@ -295,9 +295,20 @@ def test_report_end_to_end(analyzed):
     assert load_report(snapshot_id)["summary"]["headline"] == summary["headline"]
     with get_connection() as connection:
         count = connection.execute(
-            "SELECT COUNT(*) FROM graph_edges WHERE snapshot_id = ?", (snapshot_id,)
+            "SELECT COUNT(*) FROM graph_edges WHERE snapshot_id = ? AND relationship != 'calls'",
+            (snapshot_id,)
         ).fetchone()[0]
+        calls = connection.execute(
+            "SELECT source_node_id, target_node_id, evidence_status FROM graph_edges "
+            "WHERE snapshot_id = ? AND relationship = 'calls'", (snapshot_id,)).fetchall()
     assert count == len(edges)
+    prefix = len(snapshot_id) + 2
+    assert {(r[0][prefix:], r[1][prefix:], r[2]) for r in calls} == {
+        ("shop/api.py::orders", "shop/orders.py::place_order", "confirmed"),
+        ("shop/orders.py::place_order", "shop/pricing.py::total", "confirmed"),
+        ("tests/test_pricing.py::test_total", "shop/pricing.py::total", "confirmed")}
+    assert "_call_edges" not in load_report(snapshot_id)
+    assert report["calls"]["resolved"] == 3
 
 
 def test_report_is_idempotent(analyzed):

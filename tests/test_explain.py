@@ -23,9 +23,16 @@ SECRET_FILE = (b'import os\n\nAPI_KEY = "sk-live-abcdefghijklmnopqrstuvwx"\n'
                b'db_password = "hunter22"\n\ndef connect():\n    return os.environ["DB"]\n')
 
 GOOD = {
-    "summary": "Places an order by pricing its items.",
-    "key_parts": [{"symbol": "place_order", "start": 3, "end": 4, "does": "Totals the items."}],
+    "purpose": "Places an order by pricing its items.",
+    "inputs": "Uses pricing.py.",
+    "steps": [{"symbol": "place_order", "start": 3, "end": 4, "does": "Totals the items."}],
+    "outputs": "api.py imports place_order.",
+    "why": "The API needs it to place orders.",
 }
+
+
+def answer(purpose: str = "A file.", steps: list | None = None) -> dict:
+    return {"purpose": purpose, "inputs": "", "steps": steps or [], "outputs": "", "why": ""}
 
 
 @pytest.fixture
@@ -40,13 +47,15 @@ def test_the_model_gets_code_and_facts(shop):
     provider = FakeProvider(GOOD)
     result = explain.explain_file(shop, "shop/orders.py", provider)
 
-    assert result["summary"] == GOOD["summary"]
-    assert result["key_parts"] == [{"symbol": "place_order", "kind": "function", "start": 3,
-                                    "end": 4, "does": "Totals the items."}]
+    assert result["summary"] == result["purpose"] == GOOD["purpose"]
+    assert result["steps"] == [{"symbol": "place_order", "kind": "function", "start": 3,
+                                "end": 4, "does": "Totals the items.", "source": "ai-checked"}]
+    assert result["outputs"] == GOOD["outputs"] and result["why"] == GOOD["why"]
     assert result["model"] == "fake-model" and result["created_at"]
     prompt = provider.calls[0]["messages"][0]["content"]
     assert "Used by: shop/api.py" in prompt
     assert "Tested by:" in prompt
+    assert "Other files import: place_order (by shop/api.py, shop/pricing.py)" in prompt
     assert "- place_order (function): lines 3-4" in prompt
     assert "3| def place_order(items=[]):" in prompt  # numbered, so lines can be cited
     assert '<file path="shop/orders.py">' in prompt
@@ -55,14 +64,14 @@ def test_the_model_gets_code_and_facts(shop):
 
 
 def test_key_parts_must_name_real_symbols_and_lines(shop):
-    provider = FakeProvider({"summary": "Prices things.", "key_parts": [
+    provider = FakeProvider(answer("Prices things.", [
         {"symbol": "place_order()", "start": 3, "end": 3, "does": "Real, short form."},
         {"symbol": "invented", "start": 1, "end": 2, "does": "No such function."},
         {"symbol": "place_order", "start": 3, "end": 4, "does": "Duplicate."},
         {"symbol": "place_order", "start": 90, "end": 99, "does": "Lines past the end."},
-    ]})
+    ]))
     result = explain.explain_file(shop, "shop/orders.py", provider)
-    assert [(p["symbol"], p["start"], p["end"]) for p in result["key_parts"]] == \
+    assert [(p["symbol"], p["start"], p["end"]) for p in result["steps"]] == \
         [("place_order", 3, 4)]  # normalised to the symbol's real lines
     assert result["dropped"] == 3
 
@@ -72,7 +81,7 @@ def test_cached_until_the_file_changes(shop):
     explain.explain_file(shop, "shop/orders.py", provider)
     explain.explain_file(shop, "shop/orders.py", provider)
     assert len(provider.calls) == 1
-    assert explain.cached_explanation(shop, "shop/orders.py", "fake-model")["summary"]
+    assert explain.cached_explanation(shop, "shop/orders.py", "fake-model")["purpose"]
     assert explain.cached_explanation(shop, "shop/orders.py", "other-model") is None
 
     explain.explain_file(shop, "shop/orders.py", provider, refresh=True)
@@ -87,7 +96,7 @@ def test_cached_until_the_file_changes(shop):
 
 
 def test_likely_secrets_are_removed_before_sending(shop):
-    provider = FakeProvider({"summary": "Settings.", "key_parts": []})
+    provider = FakeProvider(answer("Settings."))
     result = explain.explain_file(shop, "shop/settings.py", provider)
     prompt = provider.calls[0]["messages"][0]["content"]
     assert "sk-live" not in prompt and "hunter22" not in prompt
@@ -176,7 +185,7 @@ def test_api_reads_the_cache_and_writes_on_post(client, shop, monkeypatch):
     assert provider.calls == []  # reading never calls the model
 
     posted = client.post("/api/explain", json=params).json()
-    assert posted["status"] == "ready" and posted["explanation"]["summary"] == GOOD["summary"]
+    assert posted["status"] == "ready" and posted["explanation"]["purpose"] == GOOD["purpose"]
     assert client.get("/api/explain", params=params).json()["status"] == "ready"
 
     client.post("/api/explain", json={**params, "refresh": True})
@@ -302,9 +311,9 @@ def gemini_text(text: str, finish: str = "STOP") -> dict:
 def test_gemini_sends_a_json_request_and_reads_the_answer():
     seen: list[httpx.Request] = []
     provider = gemini((200, gemini_text('{"summary": "S", "key_parts": []}')), seen=seen)
-    answer = provider.complete_structured("be brief", [{"role": "user", "content": "code"}],
-                                          explain.SCHEMA)
-    assert answer == {"summary": "S", "key_parts": []}  # thought parts are left out
+    got = provider.complete_structured("be brief", [{"role": "user", "content": "code"}],
+                                       explain.SCHEMA)
+    assert got == {"summary": "S", "key_parts": []}  # thought parts are left out
 
     request = seen[0]
     assert str(request.url).endswith("/models/gemini-3.5-flash-lite:generateContent")
@@ -315,7 +324,8 @@ def test_gemini_sends_a_json_request_and_reads_the_answer():
     config = body["generationConfig"]
     assert config["responseMimeType"] == "application/json"
     assert "additionalProperties" not in json.dumps(config["responseJsonSchema"])
-    assert config["responseJsonSchema"]["required"] == ["summary", "key_parts"]
+    assert config["responseJsonSchema"]["required"] == ["purpose", "inputs", "steps",
+                                                         "outputs", "why"]
 
 
 def test_gemini_retries_busy_answers_then_succeeds():

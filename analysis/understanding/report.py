@@ -30,6 +30,7 @@ from analysis.graph.builder import (
 from analysis.graph.resolver import JsResolver, js_aliases, package_names
 from analysis.python.quality import analyze_python
 from analysis.understanding import insights as insight_rules
+from analysis.understanding.calls import CallGraph, build_call_graph
 from analysis.understanding.profile import (
     ROLE_LABELS,
     STACK_CATALOG,
@@ -57,7 +58,7 @@ def distinct_names(paths: list[str]) -> list[str]:
     return out
 
 
-REPORT_VERSION = "2.4"
+REPORT_VERSION = "2.5"
 CODE_SUFFIXES = {".py": "Python", ".pyi": "Python", ".js": "JavaScript", ".jsx": "JavaScript",
                  ".mjs": "JavaScript", ".cjs": "JavaScript", ".ts": "TypeScript",
                  ".tsx": "TypeScript"}
@@ -92,6 +93,7 @@ RUN_NOT_IMPORT = {"uvicorn", "gunicorn", "pytest", "celery", "vite", "jest", "vi
                   "tailwindcss"}
 
 Progress = Callable[[str, int, int, str], None]
+CALL_EDGES_KEY = "_call_edges"
 
 
 class ReportError(Exception):
@@ -295,6 +297,8 @@ class _Build:
     all_files: list[dict] = field(default_factory=list)
     imports_by_file: dict[str, list[dict]] = field(default_factory=dict)
     symbols_by_file: dict[str, list[dict]] = field(default_factory=dict)
+    calls_by_file: dict[str, list[dict]] = field(default_factory=dict)
+    call_graph: CallGraph = field(default_factory=CallGraph)
     code_rows: list[dict] = field(default_factory=list)
     files: dict[str, dict[str, Any]] = field(default_factory=dict)
     lines: dict[str, list[str]] = field(default_factory=dict)
@@ -374,15 +378,21 @@ def _load(b: _Build) -> None:
             "SELECT relative_path, kind, module, name, alias, level, line FROM imports "
             "WHERE snapshot_id = ? ORDER BY relative_path, line, import_id", (b.snapshot_id,))
         symbol_rows = connection.execute(
-            "SELECT relative_path, kind, name, qualified_name, start_line, end_line FROM symbols "
-            "WHERE snapshot_id = ? ORDER BY relative_path, start_line", (b.snapshot_id,))
+            "SELECT symbol_id, relative_path, kind, name, qualified_name, start_line, end_line "
+            "FROM symbols WHERE snapshot_id = ? ORDER BY relative_path, start_line",
+            (b.snapshot_id,))
         imports: dict[str, list[dict]] = defaultdict(list)
         for row in import_rows:
             imports[row["relative_path"]].append(dict(row))
         symbols: dict[str, list[dict]] = defaultdict(list)
         for row in symbol_rows:
             symbols[row["relative_path"]].append(dict(row))
-    b.imports_by_file, b.symbols_by_file = imports, symbols
+        calls: dict[str, list[dict]] = defaultdict(list)
+        for row in connection.execute(
+                "SELECT relative_path, callee, line, enclosing_symbol FROM calls "
+                "WHERE snapshot_id = ? ORDER BY relative_path, line, call_id", (b.snapshot_id,)):
+            calls[row["relative_path"]].append(dict(row))
+    b.imports_by_file, b.symbols_by_file, b.calls_by_file = imports, symbols, calls
     b.code_rows = [f for f in b.all_files
                    if PurePosixPath(f["relative_path"]).suffix.lower() in CODE_SUFFIXES
                    and f["status"] != "skipped"]
@@ -435,6 +445,14 @@ def _map(b: _Build) -> None:
     b.tests_of = tests_of
     b.tested = _reached_through_packages(b.graph, set(tests_of))
     b.step("graph", 1, 1, f"{len(b.graph_result.edges)} connections")
+
+
+def _calls(b: _Build) -> None:
+    """Which function calls which (Python), resolved through each file's imports."""
+    python = {p for p, info in b.files.items()
+              if info["status"] == "analyzed" and info["language"] == "Python"}
+    b.call_graph = build_call_graph(python, b.symbols_by_file, b.imports_by_file,
+                                    b.calls_by_file)
 
 
 def _js_resolver(b: _Build, analyzed: list[str]) -> JsResolver:
@@ -872,11 +890,14 @@ def _files_json(b: _Build) -> list[dict]:
     graph = b.graph
     cycle_members = {p for cycle in b.graph_result.cycles for p in cycle}
     worst = _worst_severity(b)
+    call_counts = b.call_graph.counts()
     out = []
     for path in sorted(b.files):
         info = b.files[path]
         quality = info.get("quality")
         functions = quality.functions if quality else []
+        ids = {(s["qualified_name"], s["start_line"]): s["symbol_id"]
+               for s in b.symbols_by_file.get(path, [])}
         out.append({
             "path": path, "name": short_name(path), "language": info["language"],
             "status": info["status"], "failure": info["failure"], "area": b.area_for[path],
@@ -896,7 +917,11 @@ def _files_json(b: _Build) -> list[dict]:
             "severity": worst.get(path),
             "function_metrics": [
                 {"name": f.qualified_name, "start": f.start_line, "end": f.end_line,
-                 "complexity": f.complexity, "lines": f.lines, "nesting": f.max_nesting}
+                 "complexity": f.complexity, "lines": f.lines, "nesting": f.max_nesting,
+                 "id": (sid := ids.get((f.qualified_name, f.start_line))),
+                 "public": f.is_public,
+                 "callers": call_counts.get(sid, {}).get("callers", 0),
+                 "callees": call_counts.get(sid, {}).get("callees", 0)}
                 for f in functions
             ],
         })
@@ -930,8 +955,8 @@ def build_report(snapshot_id: str, progress: Progress | None = None) -> dict:
         ).fetchone())
     b = _Build(snapshot_id, snapshot, repo, resolve_root(snapshot), progress)
 
-    for stage in (_load, _measure, _map, _project_files, _stack, _roles, _insights, _areas,
-                  _flows):
+    for stage in (_load, _measure, _map, _calls, _project_files, _stack, _roles, _insights,
+                  _areas, _flows):
         stage(b)
 
     # A package is a runtime dependency only if production code imports it for real; one used
@@ -963,6 +988,15 @@ def build_report(snapshot_id: str, progress: Progress | None = None) -> dict:
         "files": files_json,
         "graph": _graph_json(b, files_json),
         "insights": b.insights,
+        "calls": {
+            "resolved": len(b.call_graph.edges),
+            "confirmed": sum(e.tier == "confirmed" for e in b.call_graph.edges),
+            "inferred": sum(e.tier == "inferred" for e in b.call_graph.edges),
+            "unresolved": b.call_graph.unresolved, "dynamic": b.call_graph.dynamic,
+        },
+        # Written to graph_nodes / graph_edges by save_report, never stored in the report.
+        CALL_EDGES_KEY: [(e.caller, e.callee, e.path, e.line, e.tier)
+                         for e in b.call_graph.edges],
         "dependencies": {
             "external": externals,
             "manifests": [{"path": m.path, "kind": m.kind,
@@ -979,6 +1013,7 @@ def build_report(snapshot_id: str, progress: Progress | None = None) -> dict:
 
 def save_report(snapshot_id: str, report: dict) -> None:
     initialize_database()
+    call_edges = report.pop(CALL_EDGES_KEY, [])
     with get_connection() as connection:
         connection.execute("DELETE FROM analysis_reports WHERE snapshot_id = ?", (snapshot_id,))
         connection.execute(
@@ -1001,6 +1036,50 @@ def save_report(snapshot_id: str, report: dict) -> None:
               e["kind"], e["source"], min(e["lines"]), max(e["lines"]), e["tier"])
              for e in report["graph"]["edges"]],
         )
+        _save_call_edges(connection, snapshot_id, call_edges)
+
+
+def _save_call_edges(connection, snapshot_id: str, edges: list) -> None:
+    """Symbol nodes (`snapshot::path::qualified_name`) and `calls` edges between them."""
+    rows = {}
+    for caller, callee, *_ in edges:
+        for sid in (caller, callee):
+            path, _, qualified = sid.partition("::")
+            rows[sid] = (f"{snapshot_id}::{sid}", snapshot_id, "symbol",
+                         qualified.split("@")[0], path)
+    connection.executemany(
+        "INSERT OR IGNORE INTO graph_nodes (node_id, snapshot_id, node_type, name, file_path, "
+        "start_line, end_line) VALUES (?, ?, ?, ?, ?, NULL, NULL)", list(rows.values()))
+    connection.executemany(
+        "INSERT INTO graph_edges (snapshot_id, source_node_id, target_node_id, relationship, "
+        "source_path, start_line, end_line, extraction_method, evidence_status) "
+        "VALUES (?, ?, ?, 'calls', ?, ?, ?, 'call-resolution', ?)",
+        [(snapshot_id, f"{snapshot_id}::{caller}", f"{snapshot_id}::{callee}", path, line, line,
+          tier) for caller, callee, path, line, tier in edges],
+    )
+
+
+def call_edges(snapshot_id: str, symbol_id: str) -> dict[str, list[dict]]:
+    """Stored callers and callees of one symbol: {"callers": [...], "callees": [...]}, each
+    {"id", "path", "line", "tier"}, where path and line are where the call is."""
+    node = f"{snapshot_id}::{symbol_id}"
+    prefix = len(snapshot_id) + 2
+    initialize_database()
+    with get_connection() as connection:
+        callers = connection.execute(
+            "SELECT source_node_id AS other, source_path, start_line, evidence_status "
+            "FROM graph_edges WHERE snapshot_id = ? AND relationship = 'calls' AND "
+            "target_node_id = ? ORDER BY source_path, start_line", (snapshot_id, node)).fetchall()
+        callees = connection.execute(
+            "SELECT target_node_id AS other, source_path, start_line, evidence_status "
+            "FROM graph_edges WHERE snapshot_id = ? AND relationship = 'calls' AND "
+            "source_node_id = ? ORDER BY start_line", (snapshot_id, node)).fetchall()
+
+    def rows(found) -> list[dict]:
+        return [{"id": r["other"][prefix:], "path": r["source_path"], "line": r["start_line"],
+                 "tier": r["evidence_status"]} for r in found]
+
+    return {"callers": rows(callers), "callees": rows(callees)}
 
 
 def load_report(snapshot_id: str) -> dict | None:

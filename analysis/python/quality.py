@@ -38,6 +38,23 @@ PLACEHOLDER_VALUE = re.compile(r"^(<.*>|\*+|x+|changeme|your[-_ ].*|example.*|te
 
 
 @dataclass
+class Parameter:
+    name: str
+    # positional_only | positional | keyword_only | var_positional (*args) | var_keyword (**kw)
+    kind: str
+    annotation: str | None = None
+    default: str | None = None
+
+
+@dataclass
+class SideEffect:
+    # file | network | database | env | subprocess | log
+    kind: str
+    call: str  # what was called or read, as written: "open", "os.environ", "requests.get"
+    line: int
+
+
+@dataclass
 class FunctionMetrics:
     qualified_name: str
     start_line: int
@@ -47,6 +64,14 @@ class FunctionMetrics:
     params: int
     is_public: bool
     has_docstring: bool
+    parameters: list[Parameter] = field(default_factory=list)  # without self / cls
+    returns: str | None = None  # the return annotation, as written
+    return_lines: list[int] = field(default_factory=list)
+    raises: list[tuple[str, int]] = field(default_factory=list)  # (exception name, line)
+    side_effects: list[SideEffect] = field(default_factory=list)
+    docstring: str | None = None
+    body_lines: int = 0  # lines of the body, not counting the docstring
+    body_start: int = 0  # the `def` line (after decorators)
 
     @property
     def lines(self) -> int:
@@ -240,6 +265,177 @@ def _deliberate_fallbacks(tree: ast.AST) -> set[int]:
     return found
 
 
+# --------------------------------------------------------------------------- function facts
+
+_NESTED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+# Path methods only: `rename` and `replace` are left out, since `str.replace` is far more common.
+FILE_METHODS = {"read_text", "read_bytes", "write_text", "write_bytes", "unlink", "mkdir",
+                "rmdir", "touch"}
+FILE_CALLS = {"open", "io.open", "os.open", "codecs.open", "os.remove", "os.unlink", "os.rename",
+              "os.replace", "os.makedirs", "os.mkdir", "os.rmdir", "os.listdir", "os.scandir",
+              "os.walk", "glob.glob", "tempfile.mkstemp", "tempfile.NamedTemporaryFile"}
+NETWORK_PREFIXES = ("requests.", "httpx.", "urllib.request.", "urllib3.", "aiohttp.", "socket.",
+                    "http.client.", "smtplib.", "ftplib.", "websockets.")
+DATABASE_METHODS = {"execute", "executemany", "executescript", "commit", "rollback",
+                    "fetchone", "fetchall", "fetchmany"}
+SESSION_METHODS = {"add", "add_all", "query", "delete", "merge", "flush", "scalars", "scalar",
+                   "get", "commit", "rollback", "refresh"}
+ENV_CALLS = {"os.getenv", "os.putenv", "os.unsetenv", "os.environ.get", "os.environ.setdefault",
+             "os.environ.pop", "os.environ.update", "os.environ.copy"}
+SUBPROCESS_CALLS = {"os.system", "os.popen", "os.execv", "os.execvp", "os.spawnv",
+                    "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell"}
+LOG_METHODS = {"debug", "info", "warning", "warn", "error", "exception", "critical", "log"}
+LOGGER_NAMES = {"logger", "log", "_logger", "_log", "LOGGER", "LOG", "logging"}
+
+
+def import_names(tree: ast.AST) -> dict[str, str]:
+    """Local name -> full dotted name, from every import in the file:
+    `import subprocess as sp` -> {"sp": "subprocess"}, `from os import getenv` ->
+    {"getenv": "os.getenv"}. Used to read `sp.run(...)` as `subprocess.run(...)`."""
+    names: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    names[alias.asname] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                if alias.name != "*":
+                    names[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return names
+
+
+def _full_name(node: ast.AST, imported: dict[str, str]) -> str | None:
+    name = _dotted(node)
+    if name is None:
+        return None
+    head, _, rest = name.partition(".")
+    if head in imported:
+        return imported[head] + (f".{rest}" if rest else "")
+    return name
+
+
+def _side_effect(call: ast.Call, imported: dict[str, str]) -> SideEffect | None:
+    """What a call reaches outside the program, judged from its name only."""
+    written = _dotted(call.func)
+    name = _full_name(call.func, imported) or ""
+    attr = call.func.attr if isinstance(call.func, ast.Attribute) else None
+    receiver = (_dotted(call.func.value) or "") if isinstance(call.func, ast.Attribute) else ""
+    shown = written or (f".{attr}" if attr else "call")
+    line = call.lineno
+    if name in FILE_CALLS or name.startswith(("shutil.", "pathlib.Path.")) or (
+            attr in FILE_METHODS):
+        return SideEffect("file", shown, line)
+    if name.startswith(NETWORK_PREFIXES) or name.endswith("urlopen"):
+        return SideEffect("network", shown, line)
+    if name.startswith(("sqlite3.", "psycopg", "pymysql.", "sqlalchemy.create_engine")) or (
+            attr in DATABASE_METHODS) or (
+            attr in SESSION_METHODS and "session" in receiver.split(".")[-1].lower()):
+        return SideEffect("database", shown, line)
+    if name in ENV_CALLS or name == "getenv":
+        return SideEffect("env", shown, line)
+    if name.startswith("subprocess.") or name in SUBPROCESS_CALLS:
+        return SideEffect("subprocess", shown, line)
+    if name == "print" or name.startswith("logging.") or name.startswith("warnings.warn") or (
+            attr in LOG_METHODS and receiver.split(".")[-1] in LOGGER_NAMES):
+        return SideEffect("log", shown, line)
+    return None
+
+
+def _own_nodes(func: ast.AST):
+    """Every node in a function's body, not descending into nested defs, classes or lambdas."""
+    stack = [n for n in reversed(getattr(func, "body", [])) if not isinstance(n, _NESTED)]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(reversed([c for c in ast.iter_child_nodes(node)
+                               if not isinstance(c, _NESTED)]))
+
+
+def _parameters(args: ast.arguments, in_class: bool) -> list[Parameter]:
+    def text(node: ast.AST | None) -> str | None:
+        if node is None:
+            return None
+        try:
+            return ast.unparse(node)
+        except Exception:  # pragma: no cover - unparse handles every parsed node
+            return None
+
+    positional = [*args.posonlyargs, *args.args]
+    defaults: list[ast.AST | None] = [None] * (len(positional) - len(args.defaults))
+    defaults += list(args.defaults)
+    out: list[Parameter] = []
+    for index, (arg, default) in enumerate(zip(positional, defaults, strict=True)):
+        if index == 0 and in_class and arg.arg in {"self", "cls"}:
+            continue
+        kind = "positional_only" if index < len(args.posonlyargs) else "positional"
+        out.append(Parameter(arg.arg, kind, text(arg.annotation), text(default)))
+    if args.vararg:
+        out.append(Parameter(args.vararg.arg, "var_positional", text(args.vararg.annotation)))
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+        out.append(Parameter(arg.arg, "keyword_only", text(arg.annotation), text(default)))
+    if args.kwarg:
+        out.append(Parameter(args.kwarg.arg, "var_keyword", text(args.kwarg.annotation)))
+    return out
+
+
+def _raised_name(node: ast.Raise) -> str | None:
+    exc = node.exc
+    if exc is None:
+        return "(re-raise)"
+    if isinstance(exc, ast.Call):
+        exc = exc.func
+    return _dotted(exc)
+
+
+def function_facts(node: ast.FunctionDef | ast.AsyncFunctionDef, in_class: bool,
+                   imported: dict[str, str]) -> dict:
+    """Parameters, return annotation and lines, raised exceptions and side effects of one
+    function, from its own body (nested functions and classes are theirs, not its)."""
+    returns: list[int] = []
+    raises: list[tuple[str, int]] = []
+    effects: list[SideEffect] = []
+    seen_effects: set[tuple[str, int]] = set()
+
+    def add(effect: SideEffect | None) -> None:
+        if effect and (effect.kind, effect.line) not in seen_effects:
+            seen_effects.add((effect.kind, effect.line))
+            effects.append(effect)
+
+    for child in _own_nodes(node):
+        if isinstance(child, ast.Return):
+            returns.append(child.lineno)
+        elif isinstance(child, ast.Raise):
+            name = _raised_name(child)
+            if name:
+                raises.append((name, child.lineno))
+        elif isinstance(child, ast.Call):
+            add(_side_effect(child, imported))
+        elif isinstance(child, ast.Attribute) and isinstance(child.ctx, ast.Load) and \
+                _full_name(child, imported) in {"os.environ"}:
+            add(SideEffect("env", "os.environ", child.lineno))
+        elif isinstance(child, ast.Name) and imported.get(child.id) == "os.environ":
+            add(SideEffect("env", child.id, child.lineno))
+
+    body = node.body
+    docstring = ast.get_docstring(node)
+    first = body[1] if docstring and len(body) > 1 else body[0]
+    if docstring and len(body) == 1:
+        body_lines = 0
+    else:
+        body_lines = (node.end_lineno or node.lineno) - first.lineno + 1
+    return {
+        "parameters": _parameters(node.args, in_class),
+        "returns": ast.unparse(node.returns) if node.returns is not None else None,
+        "return_lines": sorted(returns),
+        "raises": raises,
+        "side_effects": sorted(effects, key=lambda e: e.line),
+        "docstring": docstring.strip() if docstring else None,
+        "body_lines": body_lines,
+        "body_start": node.lineno,
+    }
+
+
 def _too_broad(handler: ast.ExceptHandler) -> bool:
     if handler.type is None:
         return True
@@ -251,6 +447,7 @@ def analyze_python(source: str, lines: list[str] | None = None) -> PythonQuality
     """Parse once and collect every quality fact. Raises SyntaxError on bad source."""
     tree = ast.parse(source)
     fallbacks = _deliberate_fallbacks(tree)
+    imported = import_names(tree)
     lines = lines if lines is not None else source.splitlines()
     quality = PythonQuality(total_lines=len(lines))
     quality.loc = sum(
@@ -309,6 +506,7 @@ def analyze_python(source: str, lines: list[str] | None = None) -> PythonQuality
                         params=count,
                         is_public=not child.name.startswith("_"),
                         has_docstring=ast.get_docstring(child) is not None,
+                        **function_facts(child, in_class, imported),
                     )
                 )
                 for default in [*params.defaults, *[d for d in params.kw_defaults if d]]:
