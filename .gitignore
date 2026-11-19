@@ -17,3 +17,8 @@ data/
 
 .vscode/
 .DS_Store
+
+# web app
+web/node_modules/
+web/dist/
+*.egg-info/
