@@ -351,7 +351,7 @@ def test_pipeline_sets_file_statuses_and_stages(snapshot_id):
     assert files["src/pkg/broken.py"][0] == "failed"
     assert "Syntax error at line 1" in files["src/pkg/broken.py"][1]
     assert files["data.json"] == ("failed", "Binary content")
-    assert files["logo.png"] == ("skipped", "Unsupported file type")
+    assert files["logo.png"] == ("skipped", "Media or document")
 
     stages = {(r["relative_path"], r["stage"]): r["status"] for r in get_file_stages(snapshot_id)}
     assert stages[("src/pkg/core.py", "python_ast")] == "analyzed"

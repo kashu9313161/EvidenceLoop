@@ -293,7 +293,7 @@ def get_connection() -> Iterator[sqlite3.Connection]:
 
 # Columns added after a table first shipped: (table, column, definition). CREATE TABLE IF NOT
 # EXISTS leaves an existing table alone, so these are added on start-up when missing.
-ADDED_COLUMNS = [("asks", "meta", "TEXT NOT NULL DEFAULT '{}'")]
+ADDED_COLUMNS = [("asks", "meta", "TEXT NOT NULL DEFAULT '{}'"), ("snapshots", "scope", "TEXT")]
 
 
 def initialize_database() -> None:
@@ -390,7 +390,7 @@ def list_snapshots() -> list[sqlite3.Row]:
             """
             SELECT s.snapshot_id, s.repository_id, s.commit_sha, s.archive_sha256,
                    s.root_path, s.total_files, s.eligible_files, s.skipped_files,
-                   s.created_at, r.source_type, r.source_url, r.owner, r.name
+                   s.created_at, s.scope, r.source_type, r.source_url, r.owner, r.name
             FROM snapshots AS s
             JOIN repositories AS r ON r.repository_id = s.repository_id
             ORDER BY s.created_at DESC, s.snapshot_id

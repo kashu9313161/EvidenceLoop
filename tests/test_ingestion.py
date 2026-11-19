@@ -7,11 +7,11 @@ import zipfile
 import httpx
 import pytest
 
-from ingestion import service
+from core import config
+from ingestion import fetch, preflight, rules, service
 from ingestion.service import (
     IngestionError,
     atomic_extract_archive,
-    github_download,
     ingest_github_repository,
     ingest_zip_file,
     parse_github_url,
@@ -173,7 +173,7 @@ def test_skip_unsupported_file(tmp_path):
     records = safe_extract_archive(archive, tmp_path)
 
     assert records[0]["status"] == "skipped"
-    assert records[0]["skip_reason"] == "Unsupported file type"
+    assert records[0]["skip_reason"] == "Media or document"
     assert not (tmp_path / "photo.png").exists()
 
 
@@ -183,12 +183,13 @@ def test_skip_ignored_directory(tmp_path):
     records = {r["relative_path"]: r for r in safe_extract_archive(archive, tmp_path)}
 
     assert records["node_modules/lib.js"]["status"] == "skipped"
+    assert records["node_modules/lib.js"]["skip_reason"] == "Installed dependencies"
     assert records["app.js"]["status"] == "pending"
     assert not (tmp_path / "node_modules").exists()
 
 
 def test_skipped_files_do_not_count_toward_size_limits(tmp_path, monkeypatch):
-    monkeypatch.setattr(service, "MAX_FILE_UNCOMPRESSED_BYTES", 10)
+    monkeypatch.setattr(rules, "MAX_FILE_ANALYSIS_BYTES", 10)
     archive = make_zip({"root/big.png": b"x" * 100, "root/app.py": b"ok"})
 
     records = safe_extract_archive(archive, tmp_path)
@@ -255,27 +256,63 @@ def test_reject_encrypted_entry(tmp_path):
         safe_extract_archive(archive, tmp_path)
 
 
-def test_reject_oversized_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(service, "MAX_FILE_UNCOMPRESSED_BYTES", 10)
+def test_an_oversized_file_is_skipped_not_extracted(tmp_path, monkeypatch):
+    monkeypatch.setattr(rules, "MAX_FILE_ANALYSIS_BYTES", 10)
 
-    with pytest.raises(IngestionError, match="File exceeds size limit"):
-        safe_extract_archive(make_zip({"root/app.py": b"x" * 11}), tmp_path)
+    records = safe_extract_archive(make_zip({"root/app.py": b"x" * 11, "root/ok.py": b"1"}),
+                                   tmp_path)
+
+    by_path = {r["relative_path"]: r for r in records}
+    assert by_path["app.py"]["skip_reason"] == "Larger than 10 bytes"
+    assert not (tmp_path / "app.py").exists()
+    assert (tmp_path / "ok.py").exists()
 
 
-def test_reject_total_size_overflow(tmp_path, monkeypatch):
-    monkeypatch.setattr(service, "MAX_TOTAL_UNCOMPRESSED_BYTES", 15)
+def test_reject_total_size_overflow_past_the_hard_ceiling(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "HARD_MAX_SOURCE_BYTES", 15)
+    monkeypatch.setattr(config, "MAX_SOURCE_BYTES", 100)
     archive = make_zip({"root/a.py": b"x" * 10, "root/b.py": b"y" * 10})
 
     with pytest.raises(IngestionError, match="total uncompressed size"):
         safe_extract_archive(archive, tmp_path)
 
 
-def test_reject_too_many_files(tmp_path, monkeypatch):
-    monkeypatch.setattr(service, "MAX_FILES", 3)
-    archive = make_zip({f"root/f{i}.py": b"x" for i in range(4)})
+def test_over_the_source_limit_a_zip_keeps_the_most_important_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "MAX_SOURCE_FILES", 3)
+    archive = make_zip({"root/README.md": b"r", "root/main.py": b"m",
+                        **{f"root/pkg/deep/f{i}.py": b"x" for i in range(4)},
+                        "root/top.py": b"t"})
 
-    with pytest.raises(IngestionError, match="too many files"):
+    records = {r["relative_path"]: r for r in safe_extract_archive(archive, tmp_path)}
+
+    kept = sorted(p for p, r in records.items() if r["status"] == "pending")
+    assert kept == ["README.md", "main.py", "top.py"]
+    assert records["pkg/deep/f0.py"]["skip_reason"] == rules.LEFT_OUT
+    assert not (tmp_path / "pkg").exists()
+
+
+def test_reject_too_many_entries(tmp_path, monkeypatch):
+    from ingestion import archive as archive_module
+
+    monkeypatch.setattr(archive_module, "MAX_LISTED_ENTRIES", 3)
+    archive = make_zip({f"root/f{i}.csv": b"x" for i in range(4)})
+
+    with pytest.raises(IngestionError, match="more than 3"):
         safe_extract_archive(archive, tmp_path)
+
+
+def test_a_zip_with_a_huge_csv_is_accepted_and_the_csv_is_skipped(tmp_path):
+    # 20 MB of data next to the code: never decompressed, so no limit is hit.
+    archive = make_zip({"root/data/train.csv": b"1,2,3\n" * 3_500_000,
+                        "root/model.pt": b"\0" * 1000, "root/app.py": b"print(1)"},
+                       zipfile.ZIP_DEFLATED)
+
+    records = {r["relative_path"]: r for r in safe_extract_archive(archive, tmp_path)}
+
+    assert records["data/train.csv"]["skip_reason"] == "Dataset"
+    assert records["model.pt"]["skip_reason"] == "Model weights"
+    assert records["app.py"]["status"] == "pending"
+    assert not (tmp_path / "data").exists()
 
 
 def test_reject_high_compression_ratio(tmp_path):
@@ -366,6 +403,16 @@ def test_atomic_extract_refuses_existing_destination(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def tree_of(archive: bytes) -> list[dict]:
+    """The git tree GitHub would list for a zipball's files (its root folder stripped)."""
+    if not archive:
+        return []
+    with zipfile.ZipFile(io.BytesIO(archive)) as z:
+        return [{"path": info.filename.split("/", 1)[1], "type": "blob", "mode": "100644",
+                 "size": info.file_size, "sha": "b" * 40}
+                for info in z.infolist() if not info.is_dir()]
+
+
 def github_transport(
     archive: bytes,
     *,
@@ -373,12 +420,27 @@ def github_transport(
     sha: str = COMMIT_SHA,
     status: int = 200,
     content_length: str | None = None,
+    tree: list[dict] | None = None,
+    raw: dict[str, bytes] | None = None,
 ) -> httpx.MockTransport:
+    """A fake api.github.com (repo, commit, tree, zipball) and raw.githubusercontent.com."""
+    listing = tree if tree is not None else tree_of(archive)
+
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
 
         if status != 200:
             return httpx.Response(status)
+
+        if request.url.host == "raw.githubusercontent.com":
+            prefix = f"/owner/repo/{sha}/"
+            name = path[len(prefix):] if path.startswith(prefix) else ""
+            if raw is not None and name in raw:
+                return httpx.Response(200, content=raw[name])
+            return httpx.Response(404)
+
+        if path == f"/repos/owner/repo/git/trees/{sha}":
+            return httpx.Response(200, json={"sha": sha, "tree": listing, "truncated": False})
 
         if path == "/repos/owner/repo":
             return httpx.Response(
@@ -397,91 +459,76 @@ def github_transport(
     return httpx.MockTransport(handler)
 
 
-def test_github_download_resolves_commit():
-    archive = make_zip({"owner-repo-aaa/app.py": b"ok"})
+def resolve(transport):
+    with preflight.open_client(transport) as client:
+        return preflight.resolve_commit(client, "owner", "repo")
 
-    metadata, sha, data = github_download(
-        "owner", "repo", transport=github_transport(archive)
-    )
 
+def test_the_preflight_resolves_the_commit():
+    metadata, sha = resolve(github_transport(b""))
     assert sha == COMMIT_SHA
-    assert data == archive
     assert metadata["default_branch"] == "main"
 
 
-def test_github_download_rejects_oversized_stream(monkeypatch):
-    monkeypatch.setattr(service, "MAX_ARCHIVE_DOWNLOAD_BYTES", 10)
-    monkeypatch.setattr(service, "DOWNLOAD_CHUNK_SIZE", 4)
-
-    with pytest.raises(IngestionError, match="download size limit"):
-        github_download("owner", "repo", transport=github_transport(b"x" * 50))
-
-
-def test_github_download_rejects_large_content_length(monkeypatch):
-    monkeypatch.setattr(service, "MAX_ARCHIVE_DOWNLOAD_BYTES", 10)
-
-    with pytest.raises(IngestionError, match="download size limit"):
-        github_download(
-            "owner", "repo",
-            transport=github_transport(b"x", content_length="999999"),
-        )
-
-
-def test_github_download_rejects_private_repo():
+def test_the_preflight_rejects_a_private_repo():
     with pytest.raises(IngestionError, match="public"):
-        github_download("owner", "repo", transport=github_transport(b"", private=True))
+        resolve(github_transport(b"", private=True))
 
 
-def test_github_download_rejects_invalid_sha():
-    with pytest.raises(IngestionError, match="commit SHA"):
-        github_download("owner", "repo", transport=github_transport(b"", sha="../x"))
+def test_the_preflight_rejects_an_invalid_sha():
+    with pytest.raises(IngestionError, match="valid commit SHA"):
+        resolve(github_transport(b"", sha="../x"))
 
 
-@pytest.mark.parametrize(
-    ("status", "message"),
-    [(404, "not found"), (403, "refused access"), (429, "limiting requests"),
-     (500, "HTTP 500")],
-)
-def test_github_download_maps_http_errors(status, message):
+@pytest.mark.parametrize(("status", "message"), [
+    (404, "not found, or it is private"),
+    (403, "refused access"),
+    (429, "limiting requests"),
+    (500, "HTTP 500"),
+])
+def test_the_preflight_maps_http_errors(status, message):
     with pytest.raises(IngestionError, match=message):
-        github_download("owner", "repo", transport=github_transport(b"", status=status))
+        resolve(github_transport(b"", status=status))
 
 
 def test_an_exhausted_rate_limit_says_when_and_how(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    reset = str(int(time.time()) + 25 * 60)
-    transport = httpx.MockTransport(lambda request: httpx.Response(
-        403, headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": reset}))
-    with pytest.raises(IngestionError) as error:
-        github_download("owner", "repo", transport=transport)
-    text = str(error.value)
-    assert "hourly request limit is used up" in text
-    assert "about 25 minutes" in text and "GITHUB_TOKEN" in text
+    reset = str(int(time.time()) + 600)
+
+    def handler(request):
+        return httpx.Response(403, headers={"x-ratelimit-remaining": "0",
+                                            "x-ratelimit-reset": reset})
+
+    with pytest.raises(IngestionError) as caught:
+        resolve(httpx.MockTransport(handler))
+    assert "limit is used up" in str(caught.value)
+    assert "10 minutes" in str(caught.value)
+    assert "GITHUB_TOKEN" in str(caught.value)
 
 
-@pytest.mark.parametrize(
-    ("failure", "message"),
-    [(httpx.ConnectError("getaddrinfo failed"), "Check your internet connection"),
-     (httpx.ReadTimeout("slow"), "took too long")],
-)
+@pytest.mark.parametrize(("failure", "message"), [
+    (httpx.ConnectTimeout("slow"), "took too long"),
+    (httpx.ConnectError("getaddrinfo failed"), "Check your internet connection"),
+])
 def test_network_failures_read_as_plain_advice(failure, message):
     def handler(request):
         raise failure
+
     with pytest.raises(IngestionError, match=message) as error:
-        github_download("owner", "repo", transport=httpx.MockTransport(handler))
+        resolve(httpx.MockTransport(handler))
     assert "getaddrinfo" not in str(error.value)
 
 
 def test_a_github_token_is_sent_when_set(monkeypatch):
-    monkeypatch.setenv("GITHUB_TOKEN", "test-token-value")
+    monkeypatch.setenv("GITHUB_TOKEN", "t0ken")
     seen = []
 
     def handler(request):
-        seen.append(request.headers.get("authorization"))
-        return httpx.Response(404)
-    with pytest.raises(IngestionError):
-        github_download("owner", "repo", transport=httpx.MockTransport(handler))
-    assert seen == ["Bearer test-token-value"]
+        seen.append(request.headers.get("Authorization"))
+        return github_transport(b"").handle_request(request)
+
+    resolve(httpx.MockTransport(handler))
+    assert seen and all(value == "Bearer t0ken" for value in seen)
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +553,10 @@ def test_ingest_github_repository_end_to_end(isolated_storage):
 
     snapshot = get_snapshot(snapshot_id)
     assert snapshot["commit_sha"] == COMMIT_SHA
-    assert snapshot["archive_sha256"] == service.sha256_bytes(archive)
+    # A digest of what was fetched (path + content hash of each selected file).
+    assert snapshot["archive_sha256"] == fetch.manifest_digest(
+        {"src/app.py": (11, service.sha256_bytes(b"print('hi')"))})
+    assert result["fetched_with"] == "zipball"  # the whole repository is tiny
 
     coverage = {row["relative_path"]: row["status"] for row in get_coverage(snapshot_id)}
     assert coverage == {"src/app.py": "pending", "logo.png": "skipped"}
@@ -566,11 +616,11 @@ def test_failed_ingest_leaves_no_snapshot(isolated_storage):
 
 
 def test_ingest_rejects_oversized_zip_upload(isolated_storage, monkeypatch):
-    monkeypatch.setattr(service, "MAX_ARCHIVE_DOWNLOAD_BYTES", 10)
+    monkeypatch.setattr(config, "MAX_UPLOAD_BYTES", 10)
     zip_path = isolated_storage / "big.zip"
     zip_path.write_bytes(make_zip({"proj/app.py": b"x" * 100}))
 
-    with pytest.raises(IngestionError, match="size limit"):
+    with pytest.raises(IngestionError, match="larger than"):
         ingest_zip_file(zip_path)
 
 

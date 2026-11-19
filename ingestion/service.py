@@ -1,57 +1,59 @@
-"""Repository ingestion: GitHub/ZIP input -> validated, immutable snapshot.
+"""Repository ingestion: GitHub, ZIP or folder input -> validated, immutable snapshot.
 
-The repository is treated as untrusted input. Nothing in it is executed,
-and every archive entry is validated before anything is written to disk.
+The repository is treated as untrusted input. Nothing in it is executed. For GitHub, a preflight
+lists every file and decides what to analyse before anything is downloaded, then only those
+files are fetched (`ingestion.preflight`, `ingestion.fetch`). Uploaded ZIPs and folders are
+filtered with the same rules (`ingestion.rules`) and only eligible files are written.
 """
 
 import hashlib
-import io
 import os
 import re
 import shutil
-import stat
+import subprocess
 import tempfile
-import time
-import zipfile
 from collections.abc import Callable
-from pathlib import Path, PurePosixPath
-from urllib.parse import quote, urlparse
+from pathlib import Path
+from typing import BinaryIO
+from urllib.parse import urlparse
 
 import httpx
 
-from core.config import (
-    DOWNLOAD_CHUNK_SIZE,
-    HTTP_TIMEOUT_SECONDS,
-    IGNORED_DIRECTORY_NAMES,
-    IGNORED_FILE_NAMES,
-    MAX_ARCHIVE_DOWNLOAD_BYTES,
-    MAX_COMPRESSION_RATIO,
-    MAX_FILE_UNCOMPRESSED_BYTES,
-    MAX_FILES,
-    MAX_TOTAL_UNCOMPRESSED_BYTES,
-    REPOSITORIES_DIR,
-    SUPPORTED_EXTENSIONS,
+from core import config
+from core.config import REPOSITORIES_DIR
+from ingestion import fetch, preflight, rules
+from ingestion.archive import safe_extract_archive
+from ingestion.preflight import PRIORITY, Entry, NeedsScope, build_plan
+from ingestion.rules import (
+    WINDOWS_RESERVED_NAMES,
+    IngestionError,
+    classify_file,
+    is_ignored_path,
+    safe_relative_path,
 )
 from storage.database import get_connection, get_snapshot, initialize_database
 
-GITHUB_API = "https://api.github.com"
+# Re-exported: callers and tests import these from here.
+__all__ = [
+    "PRIORITY", "WINDOWS_RESERVED_NAMES", "IngestionError", "NeedsScope", "atomic_extract_archive",
+    "classify_file", "ingest_folder", "ingest_github_repository", "ingest_zip_bytes",
+    "ingest_zip_file", "ingest_zip_path", "is_ignored_path", "parse_github_url",
+    "safe_extract_archive", "safe_relative_path",
+]
 
-# Names that refer to devices on Windows, regardless of extension.
-WINDOWS_RESERVED_NAMES = {
-    "con", "prn", "aux", "nul",
-    *(f"com{i}" for i in range(1, 10)),
-    *(f"lpt{i}" for i in range(1, 10)),
-}
-
-EXTRACT_CHUNK_SIZE = 1024 * 1024
-
-
-class IngestionError(Exception):
-    """Raised when a repository cannot be safely ingested."""
+COPY_CHUNK_SIZE = 1024 * 1024
 
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(COPY_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -105,425 +107,47 @@ def parse_github_url(url: str) -> tuple[str, str]:
     return owner, repository
 
 
-def _github_refusal(response: httpx.Response, has_token: bool) -> str:
-    """Explain a 403/429 from GitHub: an exhausted hourly limit says when it resets."""
-    if response.headers.get("x-ratelimit-remaining") == "0":
-        reset = response.headers.get("x-ratelimit-reset", "")
-        when = ""
-        if reset.isdigit():
-            minutes = max(1, round((int(reset) - time.time()) / 60))
-            when = f" Try again in about {minutes} minute{'s' if minutes != 1 else ''}."
-        advice = "" if has_token else (
-            " Setting a GITHUB_TOKEN environment variable raises the limit from 60 to "
-            "5,000 requests an hour.")
-        return f"GitHub's hourly request limit is used up.{when}{advice}"
-    if response.status_code == 429 or response.headers.get("retry-after"):
-        return "GitHub is limiting requests right now. Wait a minute and try again."
-    return "GitHub refused access to this repository."
+def scope_suffix(scope: str | None) -> str:
+    """What a scoped snapshot adds to its id: `#path/to/folder`, or `#top` for the most
+    important files of a repository that is over the limits."""
+    if scope is None:
+        return ""
+    return "#top" if scope == PRIORITY else f"#{scope}"
 
 
-def github_download(
-    owner: str,
-    name: str,
-    transport: httpx.BaseTransport | None = None,
-    have_commit: Callable[[str], bool] | None = None,
-) -> tuple[dict, str, bytes]:
-    """Resolve the default branch to a commit SHA and download that zipball.
-
-    The download is streamed and aborted as soon as it exceeds
-    MAX_ARCHIVE_DOWNLOAD_BYTES, whatever Content-Length claims.
-    `transport` exists so tests can run without network access. When `have_commit(sha)`
-    says that commit is already stored, the archive isn't downloaded (empty bytes).
-    """
-
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "EvidenceLoop-Local",
-    }
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
-    if token:  # optional: 5,000 API requests an hour instead of 60
-        headers["Authorization"] = f"Bearer {token}"
-
-    try:
-        with httpx.Client(
-            timeout=HTTP_TIMEOUT_SECONDS,
-            follow_redirects=True,
-            headers=headers,
-            transport=transport,
-        ) as client:
-            metadata_response = client.get(f"{GITHUB_API}/repos/{owner}/{name}")
-            metadata_response.raise_for_status()
-            metadata = metadata_response.json()
-
-            if metadata.get("private") is not False:
-                raise IngestionError("Only public repositories are supported.")
-
-            branch = metadata.get("default_branch")
-
-            if not branch:
-                raise IngestionError("Default branch not found.")
-
-            # The branch name comes from the repository's owner: encode it, so a `#` or `?`
-            # in it can't change which URL is requested.
-            commit_response = client.get(
-                f"{GITHUB_API}/repos/{owner}/{name}/commits/{quote(str(branch), safe='/')}"
-            )
-            commit_response.raise_for_status()
-            commit_sha = commit_response.json().get("sha")
-
-            if not commit_sha or not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
-                raise IngestionError("GitHub did not return a valid commit SHA.")
-
-            if have_commit is not None and have_commit(commit_sha):
-                return metadata, commit_sha, b""
-
-            buffer = io.BytesIO()
-
-            with client.stream(
-                "GET",
-                f"{GITHUB_API}/repos/{owner}/{name}/zipball/{commit_sha}",
-            ) as response:
-                response.raise_for_status()
-
-                content_length = response.headers.get("Content-Length")
-
-                if content_length and int(content_length) > MAX_ARCHIVE_DOWNLOAD_BYTES:
-                    raise IngestionError("Archive exceeds download size limit.")
-
-                for chunk in response.iter_bytes(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                    buffer.write(chunk)
-
-                    if buffer.tell() > MAX_ARCHIVE_DOWNLOAD_BYTES:
-                        raise IngestionError("Archive exceeded download size limit.")
-
-    except IngestionError:
-        raise
-
-    except httpx.HTTPStatusError as exc:
-        status = exc.response.status_code
-
-        if status == 404:
-            raise IngestionError(
-                "Repository not found or not publicly accessible."
-            ) from exc
-
-        if status in (403, 429):
-            raise IngestionError(_github_refusal(exc.response, bool(token))) from exc
-
-        raise IngestionError(
-            f"GitHub returned an error (HTTP {status}). Try again in a moment."
-        ) from exc
-
-    except httpx.TimeoutException as exc:
-        raise IngestionError("GitHub took too long to respond. Try again in a moment.") from exc
-
-    except httpx.TransportError as exc:
-        raise IngestionError(
-            "Couldn't reach GitHub. Check your internet connection and try again."
-        ) from exc
-
-    except (httpx.HTTPError, ValueError, KeyError, OSError) as exc:
-        raise IngestionError(f"GitHub download failed: {exc}") from exc
-
-    return metadata, commit_sha, buffer.getvalue()
+def _scope_folder(scope: str | None) -> str:
+    if scope is None:
+        return ""
+    return "-" + hashlib.sha256(scope.encode("utf-8")).hexdigest()[:10]
 
 
 # ---------------------------------------------------------------------------
-# Path validation and classification
+# Extraction (ZIP)
 # ---------------------------------------------------------------------------
 
 
-def safe_relative_path(name: str, strip_root: str | None = None) -> str:
-    """Validate an archive entry name and return it as a relative POSIX path.
-
-    Rejects (raises) anything that could escape the destination or that
-    Windows would interpret specially. Returns "" if nothing is left after
-    stripping the archive root.
-    """
-
-    if "\\" in name or "\x00" in name:
-        raise IngestionError(f"Unsafe archive path: {name!r}")
-
-    if re.match(r"^[A-Za-z]:", name):
-        raise IngestionError(f"Windows absolute path is not allowed: {name!r}")
-
-    path = PurePosixPath(name)
-
-    if path.is_absolute() or not path.parts:
-        raise IngestionError(f"Unsafe archive path: {name!r}")
-
-    # PurePosixPath collapses "a//b" and "a/./b"; check the raw segments too.
-    raw_parts = name.rstrip("/").split("/")
-
-    if any(part in {"", ".", ".."} for part in raw_parts):
-        raise IngestionError(f"Unsafe archive path: {name!r}")
-
-    for part in raw_parts:
-        if ":" in part:
-            raise IngestionError(f"Colon in archive path is not allowed: {name!r}")
-
-        if part != part.rstrip(" ."):
-            raise IngestionError(f"Trailing dot or space is not allowed: {name!r}")
-
-        if part.split(".")[0].lower() in WINDOWS_RESERVED_NAMES:
-            raise IngestionError(f"Reserved device name in path: {name!r}")
-
-    parts = tuple(raw_parts)
-
-    if strip_root and parts[0] == strip_root:
-        parts = parts[1:]
-
-    return "/".join(parts)
-
-
-def is_ignored_path(relative_path: str) -> bool:
-    parts = PurePosixPath(relative_path).parts
-
-    if any(part in IGNORED_DIRECTORY_NAMES for part in parts[:-1]):
-        return True
-
-    return bool(parts and parts[-1] in IGNORED_FILE_NAMES)
-
-
-def classify_file(relative_path: str) -> tuple[str, str | None]:
-    extension = PurePosixPath(relative_path).suffix.lower()
-
-    if is_ignored_path(relative_path):
-        return "skipped", "Ignored directory or file"
-
-    if extension not in SUPPORTED_EXTENSIONS:
-        return "skipped", "Unsupported file type"
-
-    return "pending", None
-
-
-def _detect_archive_root(entries: list[zipfile.ZipInfo]) -> str | None:
-    """Return the single top-level folder every entry lives under, if any.
-
-    GitHub zipballs wrap everything in `<owner>-<repo>-<sha>/`.
-    """
-
-    first_parts = set()
-
-    for entry in entries:
-        parts = entry.filename.split("/")
-
-        if len(parts) < 2 or not parts[0]:
-            return None
-
-        first_parts.add(parts[0])
-
-    if len(first_parts) == 1:
-        return first_parts.pop()
-
-    return None
-
-
-def _record(
-    relative_path: str,
-    size_bytes: int,
-    status: str,
-    skip_reason: str | None,
-    content_sha256: str | None = None,
-) -> dict:
-    return {
-        "relative_path": relative_path,
-        "extension": PurePosixPath(relative_path).suffix.lower(),
-        "size_bytes": size_bytes,
-        "content_sha256": content_sha256,
-        "status": status,
-        "skip_reason": skip_reason,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Extraction
-# ---------------------------------------------------------------------------
-
-
-def safe_extract_archive(archive_bytes: bytes, destination: Path) -> list[dict]:
-    """Validate every entry, then extract eligible regular files only.
-
-    Phase 1 (no disk writes) rejects the whole archive on: invalid ZIP,
-    too many entries, encrypted entries, unsafe paths, duplicate paths
-    (case-insensitive), oversized files, suspicious compression ratios
-    and total-size overflow. Symlinks and special files are recorded as
-    skipped and never created.
-
-    Phase 2 streams each eligible file to disk while counting the real
-    decompressed bytes, so a ZIP whose headers lie about sizes still
-    cannot exceed the limits.
-    """
-
-    destination = Path(destination)
-
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(archive_bytes))
-    except (zipfile.BadZipFile, zipfile.LargeZipFile, ValueError) as exc:
-        raise IngestionError("The uploaded file is not a valid ZIP archive.") from exc
-
-    records: list[dict] = []
-    to_extract: list[tuple[zipfile.ZipInfo, str, int]] = []
-
-    with archive:
-        entries = archive.infolist()
-        file_entries = [entry for entry in entries if not entry.is_dir()]
-
-        if len(file_entries) > MAX_FILES:
-            raise IngestionError(
-                f"Archive contains too many files ({len(file_entries)} > {MAX_FILES})."
-            )
-
-        strip_root = _detect_archive_root(entries)
-        seen_paths: set[str] = set()
-        declared_total = 0
-
-        # ---- Phase 1: validate everything before writing anything. ----
-        for entry in entries:
-            relative_path = safe_relative_path(entry.filename, strip_root=strip_root)
-
-            if entry.is_dir() or not relative_path:
-                continue
-
-            if entry.flag_bits & 0x1:
-                raise IngestionError(
-                    f"Encrypted ZIP entries are not supported: {relative_path}"
-                )
-
-            # Case-insensitive: on Windows/macOS "App.py" and "app.py" collide.
-            key = relative_path.casefold()
-
-            if key in seen_paths:
-                raise IngestionError(f"Archive contains duplicate paths: {relative_path}")
-
-            seen_paths.add(key)
-
-            # Unix file type lives in the upper 16 bits of external_attr.
-            # A type of 0 means the creator stored no type -> regular file.
-            file_type = stat.S_IFMT(entry.external_attr >> 16)
-
-            if file_type == stat.S_IFLNK:
-                records.append(_record(
-                    relative_path, entry.file_size, "skipped",
-                    "Symbolic links are not extracted",
-                ))
-                continue
-
-            if file_type not in {0, stat.S_IFREG}:
-                records.append(_record(
-                    relative_path, entry.file_size, "skipped",
-                    "Non-regular archive entry",
-                ))
-                continue
-
-            status, reason = classify_file(relative_path)
-
-            if status != "pending":
-                # Never decompressed, so size limits do not apply.
-                records.append(_record(relative_path, entry.file_size, status, reason))
-                continue
-
-            if entry.file_size > MAX_FILE_UNCOMPRESSED_BYTES:
-                raise IngestionError(f"File exceeds size limit: {relative_path}")
-
-            if entry.file_size > 0 and entry.compress_size == 0:
-                raise IngestionError(f"Invalid compression metadata: {relative_path}")
-
-            if (
-                entry.compress_size > 0
-                and entry.file_size / entry.compress_size > MAX_COMPRESSION_RATIO
-            ):
-                raise IngestionError(f"Compression ratio exceeds limit: {relative_path}")
-
-            declared_total += entry.file_size
-
-            if declared_total > MAX_TOTAL_UNCOMPRESSED_BYTES:
-                raise IngestionError("Archive exceeds total uncompressed size limit.")
-
-            to_extract.append((entry, relative_path, len(records)))
-            records.append(_record(relative_path, entry.file_size, "pending", None))
-
-        # ---- Phase 2: stream eligible files to disk with real byte counts. ----
-        destination.mkdir(parents=True, exist_ok=True)
-        resolved_destination = destination.resolve()
-        actual_total = 0
-
-        try:
-            for entry, relative_path, index in to_extract:
-                output_path = destination.joinpath(*relative_path.split("/"))
-
-                if not output_path.resolve().is_relative_to(resolved_destination):
-                    raise IngestionError(f"Unsafe archive path: {entry.filename!r}")
-
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                digest = hashlib.sha256()
-                written = 0
-
-                with archive.open(entry) as source, output_path.open("xb") as target:
-                    while chunk := source.read(EXTRACT_CHUNK_SIZE):
-                        written += len(chunk)
-                        actual_total += len(chunk)
-
-                        if written > min(entry.file_size, MAX_FILE_UNCOMPRESSED_BYTES):
-                            raise IngestionError(
-                                f"Decompressed size exceeds declared size: {relative_path}"
-                            )
-
-                        if actual_total > MAX_TOTAL_UNCOMPRESSED_BYTES:
-                            raise IngestionError(
-                                "Archive exceeds total uncompressed size limit."
-                            )
-
-                        digest.update(chunk)
-                        target.write(chunk)
-
-                if written != entry.file_size:
-                    raise IngestionError(f"Archive size mismatch for {relative_path}")
-
-                records[index]["content_sha256"] = digest.hexdigest()
-                records[index]["size_bytes"] = written
-
-        except IngestionError:
-            raise
-
-        except (zipfile.BadZipFile, EOFError) as exc:
-            raise IngestionError(f"Corrupted ZIP archive: {exc}") from exc
-
-        except (OSError, RuntimeError, NotImplementedError) as exc:
-            raise IngestionError(f"Failed to extract ZIP archive: {exc}") from exc
-
-    return records
-
-
-def atomic_extract_archive(archive_bytes: bytes, final_destination: Path) -> list[dict]:
+def atomic_extract_archive(source: bytes | Path, final_destination: Path, **options) -> list[dict]:
     """Extract into a sibling temp dir, then publish with a single rename.
 
-    A failure at any point leaves no partial snapshot behind. The temp dir
-    is created next to the destination so os.replace stays on one
-    filesystem and is atomic.
+    A failure at any point leaves no partial snapshot behind. The temp dir is created next to
+    the destination so os.replace stays on one filesystem and is atomic.
     """
-
     final_destination.parent.mkdir(parents=True, exist_ok=True)
-
     if final_destination.exists():
         raise IngestionError("Snapshot destination already exists.")
-
     temporary_directory = Path(
-        tempfile.mkdtemp(prefix=".evidenceloop-", dir=final_destination.parent)
-    )
-
+        tempfile.mkdtemp(prefix=".evidenceloop-", dir=final_destination.parent))
     try:
-        records = safe_extract_archive(archive_bytes, temporary_directory)
+        records = safe_extract_archive(source, temporary_directory, **options)
         os.replace(temporary_directory, final_destination)
         return records
-
     except Exception:
         shutil.rmtree(temporary_directory, ignore_errors=True)
         raise
 
 
 # ---------------------------------------------------------------------------
-# Persistence and entry points
+# Persistence
 # ---------------------------------------------------------------------------
 
 
@@ -535,9 +159,10 @@ def persist_snapshot(
     owner: str | None,
     name: str,
     commit_sha: str | None,
-    archive_bytes: bytes,
+    archive_sha256: str,
     records: list[dict],
     destination: Path,
+    scope: str | None = None,
 ) -> str:
     eligible = sum(record["status"] == "pending" for record in records)
     skipped = sum(record["status"] == "skipped" for record in records)
@@ -554,29 +179,19 @@ def persist_snapshot(
             """,
             (repository_id, source_type, source_url, owner, name),
         )
-
         connection.execute(
             """
             INSERT OR IGNORE INTO snapshots
             (
                 snapshot_id, repository_id, commit_sha,
                 archive_sha256, root_path, total_files,
-                eligible_files, skipped_files
+                eligible_files, skipped_files, scope
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                snapshot_id,
-                repository_id,
-                commit_sha,
-                sha256_bytes(archive_bytes),
-                str(destination.resolve()),
-                len(records),
-                eligible,
-                skipped,
-            ),
+            (snapshot_id, repository_id, commit_sha, archive_sha256,
+             str(destination.resolve()), len(records), eligible, skipped, scope),
         )
-
         connection.executemany(
             """
             INSERT OR IGNORE INTO files
@@ -587,15 +202,9 @@ def persist_snapshot(
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                (
-                    snapshot_id,
-                    record["relative_path"],
-                    record["extension"],
-                    record["size_bytes"],
-                    record["content_sha256"],
-                    record["status"],
-                    record["skip_reason"],
-                )
+                (snapshot_id, record["relative_path"], record["extension"],
+                 record["size_bytes"], record["content_sha256"], record["status"],
+                 record["skip_reason"])
                 for record in records
             ],
         )
@@ -614,125 +223,218 @@ def _summary(records: list[dict]) -> dict:
 def _prepare_destination(snapshot_id: str, destination: Path) -> bool:
     """Return True if this snapshot is already fully ingested.
 
-    A directory without a database row is left over from a crash between
-    extraction and persistence; it is removed so ingestion can start clean.
+    A directory without a database row is left over from a crash between extraction and
+    persistence; it is removed so ingestion can start clean.
     """
-
     if not destination.exists():
         return False
-
     initialize_database()
-
     if get_snapshot(snapshot_id) is not None:
         return True
-
     shutil.rmtree(destination)
     return False
 
 
-def _ingest_archive(
-    *,
-    archive_bytes: bytes,
-    snapshot_id: str,
-    repository_id: str,
-    source_type: str,
-    source_url: str | None,
-    owner: str | None,
-    name: str,
-    commit_sha: str | None,
-    destination: Path,
-) -> dict:
-    result = {
-        "repository_id": repository_id,
-        "snapshot_id": snapshot_id,
-        "commit_sha": commit_sha,
-        "root_path": str(destination),
-    }
-
-    if _prepare_destination(snapshot_id, destination):
-        return {**result, "already_downloaded": True}
-
-    records = atomic_extract_archive(archive_bytes, destination)
-
+def _persist_or_remove(destination: Path, **fields) -> None:
     try:
-        persist_snapshot(
-            snapshot_id=snapshot_id,
-            repository_id=repository_id,
-            source_type=source_type,
-            source_url=source_url,
-            owner=owner,
-            name=name,
-            commit_sha=commit_sha,
-            archive_bytes=archive_bytes,
-            records=records,
-            destination=destination,
-        )
+        persist_snapshot(destination=destination, **fields)
     except Exception:
         # Do not leave a published snapshot dir with no metadata.
         shutil.rmtree(destination, ignore_errors=True)
         raise
 
-    return {**result, **_summary(records), "already_downloaded": False}
+
+def _fill_hashes(records: list[dict], hashes: dict[str, tuple[int, str]]) -> list[dict]:
+    for record in records:
+        if record["relative_path"] in hashes:
+            record["size_bytes"], record["content_sha256"] = hashes[record["relative_path"]]
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
 
 
 def ingest_github_repository(
     url: str,
     transport: httpx.BaseTransport | None = None,
+    scope: str | None = None,
+    *,
+    on_plan: Callable[[dict], None] | None = None,
+    run: fetch.Runner = subprocess.run,
+    git: str | None | bool = True,
 ) -> dict:
+    """Preflight, then fetch only the files to analyse.
+
+    `scope` is a folder path, PRIORITY ("*": over the limits, take the most important files)
+    or None. Raises NeedsScope (with the plan) when the source is over the limits and no scope
+    says what to do. `on_plan` receives the plan as soon as it is known. `run` and `git` let
+    tests replace the git subprocess.
+    """
     owner, name = parse_github_url(url)
+    scope = preflight.normalise_scope(scope)
     repository_id = f"github:{owner}/{name}"
 
-    def destination_for(sha: str) -> Path:
-        return REPOSITORIES_DIR / f"{owner}_{name}" / sha
+    def place(sha: str, plan_scope: str | None) -> tuple[str, Path]:
+        return (f"{repository_id}@{sha}{scope_suffix(plan_scope)}",
+                REPOSITORIES_DIR / f"{owner}_{name}" / f"{sha}{_scope_folder(plan_scope)}")
 
-    # Asking again for an unchanged repository costs two small API calls, not a re-download.
-    _metadata, commit_sha, archive_bytes = github_download(
-        owner, name, transport,
-        have_commit=lambda sha: _prepare_destination(f"{repository_id}@{sha}",
-                                                     destination_for(sha)),
-    )
+    def stored(snapshot_id: str, destination: Path, sha: str) -> dict:
+        return {"repository_id": repository_id, "snapshot_id": snapshot_id, "commit_sha": sha,
+                "root_path": str(destination), "already_downloaded": True}
 
-    return _ingest_archive(
-        archive_bytes=archive_bytes,
-        snapshot_id=f"{repository_id}@{commit_sha}",
-        repository_id=repository_id,
-        source_type="github",
-        source_url=url,
-        owner=owner,
-        name=name,
-        commit_sha=commit_sha,
-        destination=destination_for(commit_sha),
-    )
+    with preflight.open_client(transport) as client:
+        _metadata, sha = preflight.resolve_commit(client, owner, name)
+        snapshot_id, destination = place(sha, scope)
+        # Asking again for an unchanged repository costs two small API calls, nothing more.
+        if _prepare_destination(snapshot_id, destination):
+            return stored(snapshot_id, destination, sha)
+        plan = preflight.preflight(client, owner, name, sha, scope)
+
+    if on_plan is not None:
+        on_plan(plan.to_dict())
+    if plan.status == "needs_scope":
+        raise NeedsScope(plan)
+
+    # "Analyse anyway" on a repository that fits is the same snapshot as no scope at all.
+    effective = scope
+    if scope == PRIORITY and len(plan.selected) == len(plan.eligible):
+        effective = None
+        snapshot_id, destination = place(sha, None)
+        if _prepare_destination(snapshot_id, destination):
+            return stored(snapshot_id, destination, sha)
+
+    records, method, digest = fetch.fetch_plan(plan, destination, transport=transport,
+                                               run=run, git=git)
+    _persist_or_remove(destination, snapshot_id=snapshot_id, repository_id=repository_id,
+                       source_type="github", source_url=url, owner=owner, name=name,
+                       commit_sha=sha, archive_sha256=digest, records=records, scope=effective)
+    return {"repository_id": repository_id, "snapshot_id": snapshot_id, "commit_sha": sha,
+            "root_path": str(destination), **_summary(records), "already_downloaded": False,
+            "fetched_with": method, "plan": plan.to_dict()}
+
+
+def _upload_limit_message() -> str:
+    return f"The ZIP is larger than {config.MAX_UPLOAD_BYTES // (1024 * 1024):,} MB."
 
 
 def ingest_zip_file(zip_path: Path) -> dict:
+    """Ingest a ZIP on disk without reading it into memory."""
     zip_path = Path(zip_path).resolve()
-
     if not zip_path.is_file() or zip_path.suffix.lower() != ".zip":
         raise IngestionError("Please provide an existing ZIP file.")
+    return ingest_zip_path(zip_path, zip_path.stem)
 
-    if zip_path.stat().st_size > MAX_ARCHIVE_DOWNLOAD_BYTES:
-        raise IngestionError("ZIP exceeds the download size limit.")
 
-    return ingest_zip_bytes(zip_path.read_bytes(), zip_path.stem)
+def ingest_zip_path(zip_path: Path, name: str) -> dict:
+    if Path(zip_path).stat().st_size > config.MAX_UPLOAD_BYTES:
+        raise IngestionError(_upload_limit_message())
+    return _ingest_zip(Path(zip_path), sha256_file(zip_path), name)
 
 
 def ingest_zip_bytes(archive_bytes: bytes, name: str) -> dict:
-    """Ingest an uploaded ZIP held in memory (e.g. from the Streamlit uploader)."""
-    if len(archive_bytes) > MAX_ARCHIVE_DOWNLOAD_BYTES:
-        raise IngestionError("ZIP exceeds the download size limit.")
+    """Ingest a ZIP held in memory (tests, small uploads)."""
+    if len(archive_bytes) > config.MAX_UPLOAD_BYTES:
+        raise IngestionError(_upload_limit_message())
+    return _ingest_zip(archive_bytes, sha256_bytes(archive_bytes), name)
 
-    archive_id = sha256_bytes(archive_bytes)[:24]
+
+def _ingest_zip(source: bytes | Path, archive_sha: str, name: str) -> dict:
+    archive_id = archive_sha[:24]
     snapshot_id = f"zip-{archive_id}"
+    destination = REPOSITORIES_DIR / "uploaded_zips" / snapshot_id
+    result = {"repository_id": f"zip:{archive_id}", "snapshot_id": snapshot_id,
+              "commit_sha": None, "root_path": str(destination)}
+    if _prepare_destination(snapshot_id, destination):
+        return {**result, "already_downloaded": True}
+    records = atomic_extract_archive(source, destination, name=name)
+    left_out = any(r["skip_reason"] == rules.LEFT_OUT for r in records)
+    _persist_or_remove(destination, snapshot_id=snapshot_id,
+                       repository_id=result["repository_id"], source_type="zip",
+                       source_url=None, owner=None, name=name or "upload", commit_sha=None,
+                       archive_sha256=archive_sha, records=records,
+                       scope=PRIORITY if left_out else None)
+    return {**result, **_summary(records), "already_downloaded": False}
 
-    return _ingest_archive(
-        archive_bytes=archive_bytes,
-        snapshot_id=snapshot_id,
-        repository_id=f"zip:{archive_id}",
-        source_type="zip",
-        source_url=None,
-        owner=None,
-        name=name or "upload",
-        commit_sha=None,
-        destination=REPOSITORIES_DIR / "uploaded_zips" / snapshot_id,
-    )
+
+def _size_of(handle: BinaryIO) -> int:
+    handle.seek(0, os.SEEK_END)
+    size = handle.tell()
+    handle.seek(0)
+    return size
+
+
+def ingest_folder(files: list[tuple[str, BinaryIO]], name: str = "") -> dict:
+    """Ingest a folder sent from the browser: (relative path, readable file) pairs.
+
+    Paths go through the same checks as archive entries (traversal, reserved names, case
+    clashes); files through the same rules. Only eligible files are written, into a temp
+    folder published with one os.replace. Over the source limits, the most important files are
+    kept (asking again would mean uploading again).
+    """
+    if not files:
+        raise IngestionError("The folder is empty.")
+    if len(files) > config.MAX_LISTED_ENTRIES:
+        raise IngestionError("The folder has too many files.")
+    raw_paths = [path for path, _ in files]
+    first = {p.split("/")[0] for p in raw_paths}
+    root = first.pop() if len(first) == 1 and all("/" in p for p in raw_paths) else None
+    entries: list[Entry] = []
+    handles: dict[str, BinaryIO] = {}
+    seen: set[str] = set()
+    for raw, handle in files:
+        path = safe_relative_path(raw, strip_root=root)
+        if not path:
+            continue
+        if path.casefold() in seen:
+            raise IngestionError(f"The folder has two files named {path} (apart from case).")
+        seen.add(path.casefold())
+        handles[path] = handle
+        entries.append(Entry(path, _size_of(handle)))
+    label = name or root or "folder"
+    plan = build_plan(entries, name=label, auto_priority=True)
+    if not plan.selected:
+        raise IngestionError("None of the folder's files can be analysed (no source code).")
+
+    parent = REPOSITORIES_DIR / "uploaded_folders"
+    parent.mkdir(parents=True, exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(prefix=".evidenceloop-", dir=parent))
+    resolved = workdir.resolve()
+    try:
+        hashes: dict[str, tuple[int, str]] = {}
+        for entry in plan.selected:
+            target = workdir.joinpath(*entry.path.split("/"))
+            if not target.resolve().is_relative_to(resolved):
+                raise IngestionError(f"Unsafe path: {entry.path!r}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            digest, written = hashlib.sha256(), 0
+            with target.open("xb") as out:
+                while chunk := handles[entry.path].read(COPY_CHUNK_SIZE):
+                    written += len(chunk)
+                    if written > entry.size:
+                        raise IngestionError(f"{entry.path} changed while it was read.")
+                    digest.update(chunk)
+                    out.write(chunk)
+            hashes[entry.path] = (written, digest.hexdigest())
+        folder_id = fetch.manifest_digest(hashes)[:24]
+        snapshot_id = f"folder-{folder_id}"
+        destination = parent / snapshot_id
+        result = {"repository_id": f"folder:{folder_id}", "snapshot_id": snapshot_id,
+                  "commit_sha": None, "root_path": str(destination)}
+        if _prepare_destination(snapshot_id, destination):
+            fetch.remove_tree(workdir)
+            return {**result, "already_downloaded": True}
+        os.replace(workdir, destination)
+    except Exception:
+        fetch.remove_tree(workdir)
+        raise
+
+    records = _fill_hashes(plan.records(), hashes)
+    left_out = len(plan.selected) < len(plan.eligible)
+    _persist_or_remove(destination, snapshot_id=snapshot_id,
+                       repository_id=result["repository_id"], source_type="folder",
+                       source_url=None, owner=None, name=label, commit_sha=None,
+                       archive_sha256=fetch.manifest_digest(hashes), records=records,
+                       scope=PRIORITY if left_out else None)
+    return {**result, **_summary(records), "already_downloaded": False}

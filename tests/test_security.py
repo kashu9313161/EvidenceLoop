@@ -10,7 +10,8 @@ from fastapi.testclient import TestClient
 from analysis.javascript.shallow import extract_file
 from analysis.understanding.explain import redact_secrets
 from api import main as api_main
-from ingestion.service import IngestionError, github_download
+from ingestion.preflight import open_client, resolve_commit
+from ingestion.service import IngestionError
 from tests.test_ingestion import make_zip
 from tests.test_understanding import SAMPLE
 
@@ -148,7 +149,8 @@ def test_the_branch_name_is_encoded_in_the_url():
         return httpx.Response(404, json={})
 
     with pytest.raises(IngestionError):  # the fake GitHub has no such commit
-        github_download("o", "n", transport=httpx.MockTransport(handler))
+        with open_client(httpx.MockTransport(handler)) as client:
+            resolve_commit(client, "o", "n")
     assert seen[1].endswith("/repos/o/n/commits/fix%231%3Fx%3Dy")
 
 
